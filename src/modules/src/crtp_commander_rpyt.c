@@ -68,9 +68,9 @@ typedef enum
   XMODE     = 2, // X-mode. M1 & M4 are defined as front
 } YawModeType;
 
-static RPYType stabilizationModeRoll  = ANGLE; // Current stabilization type of roll (rate or angle)
-static RPYType stabilizationModePitch = ANGLE; // Current stabilization type of pitch (rate or angle)
-static RPYType stabilizationModeYaw   = RATE;  // Current stabilization type of yaw (rate or angle)
+static RPYType stabilizationModeRoll  = RATE; // Current stabilization type of roll (rate or angle)
+static RPYType stabilizationModePitch = RATE; // Current stabilization type of pitch (rate or angle)
+static RPYType stabilizationModeYaw   = RATE; // Current stabilization type of yaw (rate or angle)
 
 static YawModeType yawMode = DEFAULT_YAW_MODE; // Yaw mode configuration
 
