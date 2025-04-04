@@ -35,6 +35,7 @@
 #include "log.h"
 #include "param.h"
 #include "motors.h"
+#include "platform.h"
 #include "power_distribution.h"
 #include "supervisor.h"
 #include "supervisor_state_machine.h"
@@ -118,9 +119,9 @@ bool supervisorIsArmed() {
   return supervisorMem.isArmingActivated;
 }
 
-bool supervisorIsLocked() {
-  return supervisorStateLocked == supervisorMem.state;
-}
+// bool supervisorIsLocked() {
+//   return supervisorStateLocked == supervisorMem.state;
+// }
 
 bool supervisorIsCrashed() {
   return supervisorMem.isCrashed;
@@ -219,7 +220,7 @@ static bool isFlyingCheck(SupervisorMem_t* this, const uint32_t tick) {
 static bool isTumbledCheck(SupervisorMem_t* this, const sensorData_t *data, const uint32_t tick) {
   const float freeFallThreshold = 0.1;
 
-  const float acceptedTiltAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_ACCZ;  // 60 degrees tilt (when stationary)
+  const float acceptedTiltAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_ACCZ;  // 90 degrees tilt (when stationary)
   const uint32_t maxTiltTime = M2T(SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_TIME);
 
   const float acceptedUpsideDownAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_UPSIDEDOWN_ACCZ;
@@ -288,25 +289,26 @@ static void postTransitionActions(SupervisorMem_t* this, const supervisorState_t
     }
   }
 
-  if (newState == supervisorStateLocked) {
-    DEBUG_PRINT("Locked, reboot required\n");
-  }
+  // if (newState == supervisorStateLocked) {
+  //   DEBUG_PRINT("Locked, reboot required\n");
+  // }
 
-  if (newState == supervisorStateCrashed) {
-    DEBUG_PRINT("Crashed, recovery required\n");
-    supervisorRequestCrashRecovery(false);
-  }
+  // if (newState == supervisorStateCrashed) {
+  //   DEBUG_PRINT("Crashed, recovery required\n");
+  //   supervisorRequestCrashRecovery(false);      // sets isCrashed to true
+  // }
 
   if (newState != supervisorStateReadyToFly &&
       newState != supervisorStateFlying &&
       newState != supervisorStateWarningLevelOut &&
-      newState != supervisorStateLanded) {
+      newState != supervisorStateLanded &&
+      newState != supervisorStateTurtle) {
     supervisorRequestArming(false);
   }
 
   // We do not require an arming action by the user, auto arm
   if (AUTO_ARMING) {
-    if (newState == supervisorStatePreFlChecksPassed) {
+    if (newState == supervisorStatePreFlChecksPassed || newState == supervisorStateTurtle) {
       supervisorRequestArming(true);
     }
   }
@@ -393,17 +395,17 @@ static void updateLogData(SupervisorMem_t* this, const supervisorConditionBits_t
   if (this->isTumbled) {
     this->infoBitfield |= 0x0020;
   }
-  if (supervisorStateLocked == this->state) {
-    this->infoBitfield |= 0x0040;
-  }
+  // if (supervisorStateLocked == this->state) {
+  //   this->infoBitfield |= 0x0040;
+  // }
   if (this->isCrashed) {
     this->infoBitfield |= 0x0080;
   }
 }
 
-void supervisorUpdate(const sensorData_t *sensors, const setpoint_t* setpoint, stabilizerStep_t stabilizerStep) {
+int supervisorUpdate(const sensorData_t *sensors, const setpoint_t* setpoint, stabilizerStep_t stabilizerStep) {
   if (!RATE_DO_EXECUTE(RATE_SUPERVISOR, stabilizerStep)) {
-    return;
+    return -1;
   }
 
   SupervisorMem_t* this = &supervisorMem;
@@ -411,6 +413,7 @@ void supervisorUpdate(const sensorData_t *sensors, const setpoint_t* setpoint, s
 
   const supervisorConditionBits_t conditions = updateAndPopulateConditions(this, sensors, setpoint, currentTick);
   const supervisorState_t newState = supervisorStateUpdate(this->state, conditions);
+
   if (this->state != newState) {
     const supervisorState_t previousState = this->state;
     this->state = newState;
@@ -423,6 +426,8 @@ void supervisorUpdate(const sensorData_t *sensors, const setpoint_t* setpoint, s
     this->doinfodump = 0;
     infoDump(this);
   }
+
+  return (int)(this->state == supervisorStateTurtle);
 }
 
 void supervisorOverrideSetpoint(setpoint_t* setpoint) {
@@ -431,6 +436,8 @@ void supervisorOverrideSetpoint(setpoint_t* setpoint) {
     case supervisorStateReadyToFly:
       // Fall through
     case supervisorStateLanded:
+      // Fall through
+    case supervisorStateTurtle:
       // Fall through
     case supervisorStateFlying:
       // Do nothing
@@ -460,7 +467,8 @@ bool supervisorAreMotorsAllowedToRun() {
   return (this->state == supervisorStateReadyToFly) ||
          (this->state == supervisorStateFlying) ||
          (this->state == supervisorStateWarningLevelOut) ||
-         (this->state == supervisorStateLanded);
+         (this->state == supervisorStateLanded) ||
+         (this->state == supervisorStateTurtle);
 }
 
 void infoDump(const SupervisorMem_t* this) {
