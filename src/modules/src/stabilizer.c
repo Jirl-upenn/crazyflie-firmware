@@ -24,8 +24,8 @@
  *
  */
 #define DEBUG_MODULE "STAB"
-#define TURTLE_MODE_PWM 20000
-#define TURTLE_MODE_MAX_RETRIES 3
+// #define TURTLE_MODE_PWM 20000
+// #define TURTLE_MODE_MAX_RETRIES 3
 
 #include <math.h>
 
@@ -281,12 +281,13 @@ void rateSupervisorTask(void *pvParameters) {
   }
 }
 
-int is_turtle = 0;
-uint32_t turtle_tick = 0;
-uint16_t turtle_ms_standby = 1000;
-uint16_t turtle_ms_on = 1500;
-uint16_t turtle_ms_off = 2000;
-uint8_t turtle_num_retries = 0;
+// int is_turtle = 0;
+// uint32_t turtle_tick = 0;
+// uint16_t turtle_ms_standby = 1000;
+// uint16_t turtle_ms_on = 1500;
+// uint16_t turtle_ms_off = 2000;
+// uint8_t turtle_num_retries = 0;
+uint32_t my_counter = 0;
 
 /* The stabilizer loop runs at 1kHz. It is the
  * responsibility of the different functions to run slower by skipping call
@@ -326,48 +327,54 @@ static void stabilizerTask(void* param)
 
     if (healthShallWeRunTest()) {
       healthRunTests(&sensorData);
-    } else if (is_turtle == 1 && turtle_num_retries < TURTLE_MODE_MAX_RETRIES) {
-      // if (turtle_tick % 100 == 0) {
-      //   DEBUG_PRINT("x: %f, y: %f, z: %f\n", (double) sensorData.acc.x, (double) sensorData.acc.y, (double) sensorData.acc.z);
-      // }
-      if (turtle_tick == turtle_ms_standby) {
-        float acc_x = sensorData.acc.x;
-        float acc_y = sensorData.acc.y;
-        uint16_t motor1_pwm = 0, motor2_pwm = 0, motor3_pwm = 0, motor4_pwm = 0;
-        if (fabsf(acc_x) < 0.1f && acc_y < -0.4f) {
-          motor1_pwm = TURTLE_MODE_PWM;
-          motor2_pwm = TURTLE_MODE_PWM;
-        } else if (acc_x < -0.4f && fabsf(acc_y) < 0.1f) {
-          motor2_pwm = TURTLE_MODE_PWM;
-          motor3_pwm = TURTLE_MODE_PWM;
-        } else if (fabsf(acc_x) < 0.1f && acc_y > 0.4f) {
-          motor3_pwm = TURTLE_MODE_PWM;
-          motor4_pwm = TURTLE_MODE_PWM;
-        } else if (acc_x > 0.4f && fabsf(acc_y) < 0.1f) {
-          motor4_pwm = TURTLE_MODE_PWM;
-          motor1_pwm = TURTLE_MODE_PWM;
-        }
-        motorsSetRatio(MOTOR_M1, motor1_pwm);
-        motorsSetRatio(MOTOR_M2, motor2_pwm);
-        motorsSetRatio(MOTOR_M3, motor3_pwm);
-        motorsSetRatio(MOTOR_M4, motor4_pwm);
-      } else if (turtle_tick == turtle_ms_standby + turtle_ms_on) {
-        motorsSetRatio(MOTOR_M1, 0);
-        motorsSetRatio(MOTOR_M2, 0);
-        motorsSetRatio(MOTOR_M3, 0);
-        motorsSetRatio(MOTOR_M4, 0);
-      } else if (turtle_tick == turtle_ms_standby + turtle_ms_on + turtle_ms_off) {
-        turtle_tick = 0;
-        turtle_num_retries++;
-        is_turtle = 0;
-        DEBUG_PRINT("Turtle num retries: %d\n", turtle_num_retries);
-        continue;
-      }
-      turtle_tick++;
+    // } else if (is_turtle == 1 && turtle_num_retries < TURTLE_MODE_MAX_RETRIES) {
+    //   // if (turtle_tick % 100 == 0) {
+    //   //   DEBUG_PRINT("x: %f, y: %f, z: %f\n", (double) sensorData.acc.x, (double) sensorData.acc.y, (double) sensorData.acc.z);
+    //   // }
+    //   if (turtle_tick == turtle_ms_standby) {
+    //     float acc_x = sensorData.acc.x;
+    //     float acc_y = sensorData.acc.y;
+    //     uint16_t motor1_pwm = 0, motor2_pwm = 0, motor3_pwm = 0, motor4_pwm = 0;
+    //     if (fabsf(acc_x) < 0.1f && acc_y < -0.4f) {
+    //       motor1_pwm = TURTLE_MODE_PWM;
+    //       motor2_pwm = TURTLE_MODE_PWM;
+    //     } else if (acc_x < -0.4f && fabsf(acc_y) < 0.1f) {
+    //       motor2_pwm = TURTLE_MODE_PWM;
+    //       motor3_pwm = TURTLE_MODE_PWM;
+    //     } else if (fabsf(acc_x) < 0.1f && acc_y > 0.4f) {
+    //       motor3_pwm = TURTLE_MODE_PWM;
+    //       motor4_pwm = TURTLE_MODE_PWM;
+    //     } else if (acc_x > 0.4f && fabsf(acc_y) < 0.1f) {
+    //       motor4_pwm = TURTLE_MODE_PWM;
+    //       motor1_pwm = TURTLE_MODE_PWM;
+    //     }
+    //     motorsSetRatio(MOTOR_M1, motor1_pwm);
+    //     motorsSetRatio(MOTOR_M2, motor2_pwm);
+    //     motorsSetRatio(MOTOR_M3, motor3_pwm);
+    //     motorsSetRatio(MOTOR_M4, motor4_pwm);
+    //   } else if (turtle_tick == turtle_ms_standby + turtle_ms_on) {
+    //     motorsSetRatio(MOTOR_M1, 0);
+    //     motorsSetRatio(MOTOR_M2, 0);
+    //     motorsSetRatio(MOTOR_M3, 0);
+    //     motorsSetRatio(MOTOR_M4, 0);
+    //   } else if (turtle_tick == turtle_ms_standby + turtle_ms_on + turtle_ms_off) {
+    //     turtle_tick = 0;
+    //     turtle_num_retries++;
+    //     is_turtle = 0;
+    //     DEBUG_PRINT("Turtle num retries: %d\n", turtle_num_retries);
+    //     continue;
+    //   }
+    //   turtle_tick++;
     } else {
       updateStateEstimatorAndControllerTypes();
 
       stateEstimator(&state, stabilizerStep);
+
+      // print state
+      // if (my_counter % 100 == 0) {
+      //   DEBUG_PRINT("State: %f, %f, %f\n", (double) state.position.x, (double) state.position.y, (double) state.position.z);
+      // }
+      // my_counter++;
 
       const bool areMotorsAllowedToRun = supervisorAreMotorsAllowedToRun();
 
@@ -381,15 +388,28 @@ static void stabilizerTask(void* param)
 
       // Critical for safety, be careful if you modify this code!
       // Let the supervisor update its view of the current situation
-      is_turtle = supervisorUpdate(&sensorData, &setpoint, stabilizerStep);
-      if (is_turtle == 0) turtle_num_retries = 0;
+      // is_turtle = supervisorUpdate(&sensorData, &setpoint, stabilizerStep);
+      // if (is_turtle == 0) turtle_num_retries = 0;
+      supervisorUpdate(&sensorData, &setpoint, stabilizerStep);
+
+      // setpoint.timestamp = xTaskGetTickCount();
+      // setpoint.mode.x = modeDisable;
+      // setpoint.mode.y = modeDisable;
+      // setpoint.mode.z = modeDisable;
+      // setpoint.mode.roll = modeAbs;
+      // setpoint.mode.pitch = modeAbs;
+      // setpoint.mode.yaw = modeVelocity;
+      // setpoint.attitude.roll = 0;
+      // setpoint.attitude.pitch = 0;
+      // setpoint.attitudeRate.yaw = 0;
+      // setpoint.thrust = 20000;
 
       // Let the collision avoidance module modify the setpoint, if needed
-      collisionAvoidanceUpdateSetpoint(&setpoint, &sensorData, &state, stabilizerStep);
+      // collisionAvoidanceUpdateSetpoint(&setpoint, &sensorData, &state, stabilizerStep);
 
       // Critical for safety, be careful if you modify this code!
       // Let the supervisor modify the setpoint to handle exceptional conditions
-      supervisorOverrideSetpoint(&setpoint);
+      // supervisorOverrideSetpoint(&setpoint);
 
       controller(&control, &setpoint, &sensorData, &state, stabilizerStep);
 

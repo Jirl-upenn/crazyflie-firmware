@@ -55,12 +55,15 @@
 
 #define COMMANDER_WDT_TIMEOUT_STABILIZE  M2T(500)
 #define COMMANDER_WDT_TIMEOUT_SHUTDOWN   M2T(2000)
+#define FREEFALL_TIMEOUT_MS              M2T(200)
 
-#ifndef CONFIG_MOTORS_REQUIRE_ARMING
-  #define AUTO_ARMING 1
-#else
-  #define AUTO_ARMING 0
-#endif
+// #ifndef CONFIG_MOTORS_REQUIRE_ARMING
+//   #define AUTO_ARMING 1
+// #else
+//   #define AUTO_ARMING 0
+// #endif
+
+#define AUTO_ARMING 0
 
 static uint16_t preflightTimeoutDuration = PREFLIGHT_TIMEOUT_MS;
 static uint16_t landingTimeoutDuration = LANDING_TIMEOUT_MS;
@@ -71,6 +74,7 @@ typedef struct {
   bool isTumbled;
   bool isArmingActivated;
   bool isCrashed;
+  bool isFreeFalling;
   uint16_t infoBitfield;
   uint8_t paramEmergencyStop;
 
@@ -112,7 +116,8 @@ bool supervisorIsTumbled() {
 }
 
 bool supervisorCanArm() {
-  return supervisorStatePreFlChecksPassed == supervisorMem.state;
+  return supervisorStatePreFlChecksPassed == supervisorMem.state ||
+         supervisorStateFreeFall == supervisorMem.state;
 }
 
 bool supervisorIsArmed() {
@@ -181,6 +186,22 @@ bool supervisorRequestArming(const bool doArm) {
   return true;
 }
 
+uint32_t start_freefall_tick = 0;
+bool supervisorIsFreeFalling(const sensorData_t *data, const uint32_t currentTick) {
+  const float freeFallThreshold = 0.1;
+  bool cond = fabsf(data->acc.z) < freeFallThreshold && fabsf(data->acc.y) < freeFallThreshold && fabsf(data->acc.x) < freeFallThreshold;
+  if (cond) {
+    if (start_freefall_tick == 0) {
+      start_freefall_tick = currentTick;
+    }
+  } else {
+    start_freefall_tick = 0;
+    return false;
+  }
+  const uint32_t freefalling_time = currentTick - start_freefall_tick;
+  return freefalling_time > FREEFALL_TIMEOUT_MS;
+}
+
 //
 // We say we are flying if one or more motors are running over the idle thrust.
 //
@@ -218,16 +239,13 @@ static bool isFlyingCheck(SupervisorMem_t* this, const uint32_t tick) {
 // significant thrust when accidentally crashing into walls or the ground.
 //
 static bool isTumbledCheck(SupervisorMem_t* this, const sensorData_t *data, const uint32_t tick) {
-  const float freeFallThreshold = 0.1;
-
   const float acceptedTiltAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_ACCZ;  // 90 degrees tilt (when stationary)
   const uint32_t maxTiltTime = M2T(SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_TIME);
 
   const float acceptedUpsideDownAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_UPSIDEDOWN_ACCZ;
   const uint32_t maxUpsideDownTime = M2T(SUPERVISOR_TUMBLE_CHECK_ACCEPTED_UPSIDEDOWN_TIME);
 
-  const bool isFreeFalling = (fabsf(data->acc.z) < freeFallThreshold && fabsf(data->acc.y) < freeFallThreshold && fabsf(data->acc.x) < freeFallThreshold);
-  if (isFreeFalling) {
+  if (supervisorIsFreeFalling(data, tick)) {
     // Falling is OK, reset
     this->initialTumbleTick = 0;
   }
@@ -282,8 +300,8 @@ static void postTransitionActions(SupervisorMem_t* this, const supervisorState_t
     supervisorSetLatestLandingTime(this, currentTick);
   }
 
-  if (((previousState == supervisorStateFlying || previousState == supervisorStateLanded) && (newState == supervisorStateReset))
-       || (previousState == supervisorStateReadyToFly && newState == supervisorStatePreFlChecksPassed)) {
+  if (((previousState == supervisorStateFlying || previousState == supervisorStateLanded) && (newState == supervisorStateReset)) ||
+       (previousState == supervisorStateReadyToFly && newState == supervisorStatePreFlChecksPassed)) {
     if (!AUTO_ARMING){
       DEBUG_PRINT("Disarming\n");
     }
@@ -302,13 +320,20 @@ static void postTransitionActions(SupervisorMem_t* this, const supervisorState_t
       newState != supervisorStateFlying &&
       newState != supervisorStateWarningLevelOut &&
       newState != supervisorStateLanded &&
-      newState != supervisorStateTurtle) {
+      // newState != supervisorStateTurtle &&
+      newState != supervisorStateFreeFall &&
+      newState != supervisorStateRecovery) {
     supervisorRequestArming(false);
+  }
+
+  if (newState == supervisorStateFreeFall) {
+    DEBUG_PRINT("Free falling, arming\n");
+    supervisorRequestArming(true);
   }
 
   // We do not require an arming action by the user, auto arm
   if (AUTO_ARMING) {
-    if (newState == supervisorStatePreFlChecksPassed || newState == supervisorStateTurtle) {
+    if (newState == supervisorStatePreFlChecksPassed || newState == supervisorStateRecovery) {
       supervisorRequestArming(true);
     }
   }
@@ -368,6 +393,10 @@ static supervisorConditionBits_t updateAndPopulateConditions(SupervisorMem_t* th
     conditions |= SUPERVISOR_CB_LANDING_TIMEOUT;
   }
 
+  if (supervisorIsFreeFalling(sensors, currentTick)) {
+    conditions |= SUPERVISOR_CB_IS_FREE_FALLING;
+  }
+
   return conditions;
 }
 
@@ -410,7 +439,7 @@ int supervisorUpdate(const sensorData_t *sensors, const setpoint_t* setpoint, st
 
   SupervisorMem_t* this = &supervisorMem;
   const uint32_t currentTick = xTaskGetTickCount();
-
+  
   const supervisorConditionBits_t conditions = updateAndPopulateConditions(this, sensors, setpoint, currentTick);
   const supervisorState_t newState = supervisorStateUpdate(this->state, conditions);
 
@@ -427,7 +456,8 @@ int supervisorUpdate(const sensorData_t *sensors, const setpoint_t* setpoint, st
     infoDump(this);
   }
 
-  return (int)(this->state == supervisorStateTurtle);
+  // return (int)(this->state == supervisorStateTurtle);
+  return 0;
 }
 
 void supervisorOverrideSetpoint(setpoint_t* setpoint) {
@@ -437,11 +467,23 @@ void supervisorOverrideSetpoint(setpoint_t* setpoint) {
       // Fall through
     case supervisorStateLanded:
       // Fall through
-    case supervisorStateTurtle:
-      // Fall through
+    // case supervisorStateTurtle:
+    //   // Fall through
     case supervisorStateFlying:
       // Do nothing
       break;
+
+    case supervisorStateRecovery:
+      setpoint->mode.x = modeDisable;
+      setpoint->mode.y = modeDisable;
+      setpoint->mode.z = modeDisable;
+      setpoint->mode.roll = modeAbs;
+      setpoint->mode.pitch = modeAbs;
+      setpoint->mode.yaw = modeVelocity;
+      setpoint->attitude.roll = 0;
+      setpoint->attitude.pitch = 0;
+      setpoint->attitudeRate.yaw = 0;
+      setpoint->thrust = 40000;
 
     case supervisorStateWarningLevelOut:
       setpoint->mode.x = modeDisable;
@@ -468,7 +510,9 @@ bool supervisorAreMotorsAllowedToRun() {
          (this->state == supervisorStateFlying) ||
          (this->state == supervisorStateWarningLevelOut) ||
          (this->state == supervisorStateLanded) ||
-         (this->state == supervisorStateTurtle);
+        //  (this->state == supervisorStateTurtle) ||
+         (this->state == supervisorStateFreeFall) ||
+         (this->state == supervisorStateRecovery);
 }
 
 void infoDump(const SupervisorMem_t* this) {
