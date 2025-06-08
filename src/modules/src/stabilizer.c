@@ -325,7 +325,7 @@ static void stabilizerTask(void* param)
       const bool areMotorsAllowedToRun = supervisorAreMotorsAllowedToRun();
 
       // Critical for safety, be careful if you modify this code!
-      crtpCommanderBlock(! areMotorsAllowedToRun);
+      crtpCommanderBlock(!areMotorsAllowedToRun);
 
       if (crtpCommanderHighLevelGetSetpoint(&tempSetpoint, &state, stabilizerStep)) {
         commanderSetSetpoint(&tempSetpoint, COMMANDER_PRIORITY_HIGHLEVEL);

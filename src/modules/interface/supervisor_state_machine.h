@@ -36,7 +36,7 @@ typedef enum {
     supervisorStateReset,
     supervisorStateWarningLevelOut,
     supervisorStateExceptFreeFall,
-    supervisorStateLocked,
+    // supervisorStateLocked,
     supervisorStateCrashed,
     supervisorState_NrOfStates,
 } supervisorState_t;

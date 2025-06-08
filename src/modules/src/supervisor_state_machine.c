@@ -46,7 +46,7 @@ static const char* const stateNames[] = {
   "Reset",
   "Warning, level out",
   "Exception, free fall",
-  "Locked",
+  // "Locked",
   "Crashed",
 };
 static_assert(sizeof(stateNames) / sizeof(stateNames[0]) == supervisorState_NrOfStates);
@@ -139,7 +139,7 @@ static SupervisorStateTransition_t transitionsReadyToFly[] = {
   {
     .newState = supervisorStatePreFlChecksNotPassed,
 
-    .triggers = SUPERVISOR_CB_IS_TUMBLED | SUPERVISOR_CB_PREFLIGHT_TIMEOUT,
+    .triggers = SUPERVISOR_CB_PREFLIGHT_TIMEOUT,
     .negatedTriggers = SUPERVISOR_CB_ARMED,
     .triggerCombiner = supervisorAny,
 
@@ -258,24 +258,13 @@ static SupervisorStateTransition_t transitionsWarningLevelOut[] = {
 
 static SupervisorStateTransition_t transitionsExceptFreeFall[] = {
   {
-    .newState = supervisorStateLocked,
+    .newState = supervisorStateCrashed,
 
     .triggerCombiner = supervisorAlways,
 
     .blockerCombiner = supervisorNever,
   },
 };
-
-static SupervisorStateTransition_t transitionsLocked[] = {
-  {
-    .newState = supervisorStateLocked,
-
-    .triggerCombiner = supervisorNever,
-
-    .blockerCombiner = supervisorAlways,
-  },
-};
-
 
 static SupervisorStateTransition_t transitionsTumbled[] = {
   {
@@ -287,15 +276,15 @@ static SupervisorStateTransition_t transitionsTumbled[] = {
 
     .blockerCombiner = supervisorNever
   },
-  {
-    .newState = supervisorStateLocked,
+  // {
+  //   .newState = supervisorStateLocked,
 
-    .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAll,
+  //   .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
+  //   .negatedTriggers = SUPERVISOR_CB_NONE,
+  //   .triggerCombiner = supervisorAll,
 
-    .blockerCombiner = supervisorNever
-  },
+  //   .blockerCombiner = supervisorNever
+  // },
 };
 
 SupervisorStateTransitionList_t transitionLists[] = {
@@ -308,7 +297,7 @@ SupervisorStateTransitionList_t transitionLists[] = {
   {SUPERVISOR_TRANSITION_ENTRY(transitionsReset)},
   {SUPERVISOR_TRANSITION_ENTRY(transitionsWarningLevelOut)},
   {SUPERVISOR_TRANSITION_ENTRY(transitionsExceptFreeFall)},
-  {SUPERVISOR_TRANSITION_ENTRY(transitionsLocked)},
+  // {SUPERVISOR_TRANSITION_ENTRY(transitionsLocked)},
   {SUPERVISOR_TRANSITION_ENTRY(transitionsTumbled)},
 };
 static_assert(sizeof(transitionLists) / sizeof(transitionLists[0]) == supervisorState_NrOfStates);

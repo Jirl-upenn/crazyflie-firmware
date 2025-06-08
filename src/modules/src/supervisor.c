@@ -118,9 +118,9 @@ bool supervisorIsArmed() {
   return supervisorMem.isArmingActivated;
 }
 
-bool supervisorIsLocked() {
-  return supervisorStateLocked == supervisorMem.state;
-}
+// bool supervisorIsLocked() {
+//   return supervisorStateLocked == supervisorMem.state;
+// }
 
 bool supervisorIsCrashed() {
   return supervisorMem.isCrashed;
@@ -219,7 +219,7 @@ static bool isFlyingCheck(SupervisorMem_t* this, const uint32_t tick) {
 static bool isTumbledCheck(SupervisorMem_t* this, const sensorData_t *data, const uint32_t tick) {
   const float freeFallThreshold = 0.1;
 
-  const float acceptedTiltAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_ACCZ;  // 60 degrees tilt (when stationary)
+  const float acceptedTiltAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_ACCZ;  // 90 degrees tilt (when stationary)
   const uint32_t maxTiltTime = M2T(SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_TIME);
 
   const float acceptedUpsideDownAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_UPSIDEDOWN_ACCZ;
@@ -288,14 +288,14 @@ static void postTransitionActions(SupervisorMem_t* this, const supervisorState_t
     }
   }
 
-  if (newState == supervisorStateLocked) {
-    DEBUG_PRINT("Locked, reboot required\n");
-  }
+  // if (newState == supervisorStateLocked) {
+  //   DEBUG_PRINT("Locked, reboot required\n");
+  // }
 
-  if (newState == supervisorStateCrashed) {
-    DEBUG_PRINT("Crashed, recovery required\n");
-    supervisorRequestCrashRecovery(false);
-  }
+  // if (newState == supervisorStateCrashed) {
+  //   DEBUG_PRINT("Crashed, recovery required\n");
+  //   supervisorRequestCrashRecovery(false);
+  // }
 
   if (newState != supervisorStateReadyToFly &&
       newState != supervisorStateFlying &&
@@ -393,9 +393,9 @@ static void updateLogData(SupervisorMem_t* this, const supervisorConditionBits_t
   if (this->isTumbled) {
     this->infoBitfield |= 0x0020;
   }
-  if (supervisorStateLocked == this->state) {
-    this->infoBitfield |= 0x0040;
-  }
+  // if (supervisorStateLocked == this->state) {
+  //   this->infoBitfield |= 0x0040;
+  // }
   if (this->isCrashed) {
     this->infoBitfield |= 0x0080;
   }
@@ -436,17 +436,17 @@ void supervisorOverrideSetpoint(setpoint_t* setpoint) {
       // Do nothing
       break;
 
-    case supervisorStateWarningLevelOut:
-      setpoint->mode.x = modeDisable;
-      setpoint->mode.y = modeDisable;
-      setpoint->mode.roll = modeAbs;
-      setpoint->mode.pitch = modeAbs;
-      setpoint->mode.yaw = modeVelocity;
-      setpoint->attitude.roll = 0;
-      setpoint->attitude.pitch = 0;
-      setpoint->attitudeRate.yaw = 0;
-      // Keep Z as it is
-      break;
+    // case supervisorStateWarningLevelOut:
+    //   setpoint->mode.x = modeDisable;
+    //   setpoint->mode.y = modeDisable;
+    //   setpoint->mode.roll = modeAbs;
+    //   setpoint->mode.pitch = modeAbs;
+    //   setpoint->mode.yaw = modeVelocity;
+    //   setpoint->attitude.roll = 0;
+    //   setpoint->attitude.pitch = 0;
+    //   setpoint->attitudeRate.yaw = 0;
+    //   // Keep Z as it is
+    //   break;
 
     default:
       // Replace with null setpoint to stop motors
