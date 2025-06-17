@@ -44,8 +44,8 @@ static const char* const stateNames[] = {
   "Flying",
   "Landed",
   "Reset",
-  "Warning, level out",
-  "Exception, free fall",
+  // "Warning, level out",
+  // "Exception, free fall",
   // "Locked",
   "Crashed",
 };
@@ -74,15 +74,15 @@ static SupervisorStateTransition_t transitionsNotInitialized[] = {
 };
 
 static SupervisorStateTransition_t transitionsPreFlChecksNotPassed[] = {
-  {
-    .newState = supervisorStateExceptFreeFall,
+  // {
+  //   .newState = supervisorStateExceptFreeFall,
 
-    .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAny,
+  //   .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
+  //   .negatedTriggers = SUPERVISOR_CB_NONE,
+  //   .triggerCombiner = supervisorAny,
 
-    .blockerCombiner = supervisorNever,
-  },
+  //   .blockerCombiner = supervisorNever,
+  // },
   {
     .newState = supervisorStatePreFlChecksPassed,
 
@@ -95,15 +95,15 @@ static SupervisorStateTransition_t transitionsPreFlChecksNotPassed[] = {
 };
 
 static SupervisorStateTransition_t transitionsPreFlChecksPassed[] = {
-  {
-    .newState = supervisorStateExceptFreeFall,
+  // {
+  //   .newState = supervisorStateExceptFreeFall,
 
-    .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAny,
+  //   .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
+  //   .negatedTriggers = SUPERVISOR_CB_NONE,
+  //   .triggerCombiner = supervisorAny,
 
-    .blockerCombiner = supervisorNever,
-  },
+  //   .blockerCombiner = supervisorNever,
+  // },
   {
     .newState = supervisorStatePreFlChecksNotPassed,
 
@@ -127,15 +127,15 @@ static SupervisorStateTransition_t transitionsPreFlChecksPassed[] = {
 };
 
 static SupervisorStateTransition_t transitionsReadyToFly[] = {
-  {
-    .newState = supervisorStateExceptFreeFall,
+  // {
+  //   .newState = supervisorStateExceptFreeFall,
 
-    .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAny,
+  //   .triggers = SUPERVISOR_CB_EMERGENCY_STOP,
+  //   .negatedTriggers = SUPERVISOR_CB_NONE,
+  //   .triggerCombiner = supervisorAny,
 
-    .blockerCombiner = supervisorNever,
-  },
+  //   .blockerCombiner = supervisorNever,
+  // },
   {
     .newState = supervisorStatePreFlChecksNotPassed,
 
@@ -157,15 +157,15 @@ static SupervisorStateTransition_t transitionsReadyToFly[] = {
 };
 
 static SupervisorStateTransition_t transitionsFlying[] = {
-  {
-    .newState = supervisorStateExceptFreeFall,
+  // {
+  //   .newState = supervisorStateExceptFreeFall,
 
-    .triggers = SUPERVISOR_CB_COMMANDER_WDT_TIMEOUT | SUPERVISOR_CB_EMERGENCY_STOP,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAny,
+  //   .triggers = SUPERVISOR_CB_COMMANDER_WDT_TIMEOUT | SUPERVISOR_CB_EMERGENCY_STOP,
+  //   .negatedTriggers = SUPERVISOR_CB_NONE,
+  //   .triggerCombiner = supervisorAny,
 
-    .blockerCombiner = supervisorNever,
-  },
+  //   .blockerCombiner = supervisorNever,
+  // },
   {
     .newState = supervisorStateCrashed,
 
@@ -184,15 +184,15 @@ static SupervisorStateTransition_t transitionsFlying[] = {
 
     .blockerCombiner = supervisorNever,
   },
-  {
-    .newState = supervisorStateWarningLevelOut,
+  // {
+  //   .newState = supervisorStateWarningLevelOut,
 
-    .triggers = SUPERVISOR_CB_COMMANDER_WDT_WARNING,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAll,
+  //   .triggers = SUPERVISOR_CB_COMMANDER_WDT_WARNING,
+  //   .negatedTriggers = SUPERVISOR_CB_NONE,
+  //   .triggerCombiner = supervisorAll,
 
-    .blockerCombiner = supervisorNever,
-  },
+  //   .blockerCombiner = supervisorNever,
+  // },
   {
     .newState = supervisorStateLanded,
 
@@ -235,36 +235,36 @@ static SupervisorStateTransition_t transitionsReset[] = {
   },
 };
 
-static SupervisorStateTransition_t transitionsWarningLevelOut[] = {
-  {
-    .newState = supervisorStateExceptFreeFall,
+// static SupervisorStateTransition_t transitionsWarningLevelOut[] = {
+//   {
+//     .newState = supervisorStateExceptFreeFall,
 
-    .triggers = SUPERVISOR_CB_COMMANDER_WDT_TIMEOUT | SUPERVISOR_CB_IS_TUMBLED | SUPERVISOR_CB_EMERGENCY_STOP,
-    .negatedTriggers = SUPERVISOR_CB_NONE,
-    .triggerCombiner = supervisorAny,
+//     .triggers = SUPERVISOR_CB_COMMANDER_WDT_TIMEOUT | SUPERVISOR_CB_IS_TUMBLED | SUPERVISOR_CB_EMERGENCY_STOP,
+//     .negatedTriggers = SUPERVISOR_CB_NONE,
+//     .triggerCombiner = supervisorAny,
 
-    .blockerCombiner = supervisorNever,
-  },
-  {
-    .newState = supervisorStateFlying,
+//     .blockerCombiner = supervisorNever,
+//   },
+//   {
+//     .newState = supervisorStateFlying,
 
-    .triggers = SUPERVISOR_CB_NONE,
-    .negatedTriggers = SUPERVISOR_CB_COMMANDER_WDT_WARNING | SUPERVISOR_CB_COMMANDER_WDT_TIMEOUT,
-    .triggerCombiner = supervisorAll,
+//     .triggers = SUPERVISOR_CB_NONE,
+//     .negatedTriggers = SUPERVISOR_CB_COMMANDER_WDT_WARNING | SUPERVISOR_CB_COMMANDER_WDT_TIMEOUT,
+//     .triggerCombiner = supervisorAll,
 
-    .blockerCombiner = supervisorNever,
-  },
-};
+//     .blockerCombiner = supervisorNever,
+//   },
+// };
 
-static SupervisorStateTransition_t transitionsExceptFreeFall[] = {
-  {
-    .newState = supervisorStateCrashed,
+// static SupervisorStateTransition_t transitionsExceptFreeFall[] = {
+//   {
+//     .newState = supervisorStateCrashed,
 
-    .triggerCombiner = supervisorAlways,
+//     .triggerCombiner = supervisorAlways,
 
-    .blockerCombiner = supervisorNever,
-  },
-};
+//     .blockerCombiner = supervisorNever,
+//   },
+// };
 
 static SupervisorStateTransition_t transitionsTumbled[] = {
   {
@@ -295,8 +295,8 @@ SupervisorStateTransitionList_t transitionLists[] = {
   {SUPERVISOR_TRANSITION_ENTRY(transitionsFlying)},
   {SUPERVISOR_TRANSITION_ENTRY(transitionsLanded)},
   {SUPERVISOR_TRANSITION_ENTRY(transitionsReset)},
-  {SUPERVISOR_TRANSITION_ENTRY(transitionsWarningLevelOut)},
-  {SUPERVISOR_TRANSITION_ENTRY(transitionsExceptFreeFall)},
+  // {SUPERVISOR_TRANSITION_ENTRY(transitionsWarningLevelOut)},
+  // {SUPERVISOR_TRANSITION_ENTRY(transitionsExceptFreeFall)},
   // {SUPERVISOR_TRANSITION_ENTRY(transitionsLocked)},
   {SUPERVISOR_TRANSITION_ENTRY(transitionsTumbled)},
 };

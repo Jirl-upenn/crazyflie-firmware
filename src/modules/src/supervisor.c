@@ -217,7 +217,7 @@ static bool isFlyingCheck(SupervisorMem_t* this, const uint32_t tick) {
 // significant thrust when accidentally crashing into walls or the ground.
 //
 static bool isTumbledCheck(SupervisorMem_t* this, const sensorData_t *data, const uint32_t tick) {
-  const float freeFallThreshold = 0.1;
+  // const float freeFallThreshold = 0.1;
 
   const float acceptedTiltAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_ACCZ;  // 90 degrees tilt (when stationary)
   const uint32_t maxTiltTime = M2T(SUPERVISOR_TUMBLE_CHECK_ACCEPTED_TILT_TIME);
@@ -225,11 +225,11 @@ static bool isTumbledCheck(SupervisorMem_t* this, const sensorData_t *data, cons
   const float acceptedUpsideDownAccZ = SUPERVISOR_TUMBLE_CHECK_ACCEPTED_UPSIDEDOWN_ACCZ;
   const uint32_t maxUpsideDownTime = M2T(SUPERVISOR_TUMBLE_CHECK_ACCEPTED_UPSIDEDOWN_TIME);
 
-  const bool isFreeFalling = (fabsf(data->acc.z) < freeFallThreshold && fabsf(data->acc.y) < freeFallThreshold && fabsf(data->acc.x) < freeFallThreshold);
-  if (isFreeFalling) {
-    // Falling is OK, reset
-    this->initialTumbleTick = 0;
-  }
+  // const bool isFreeFalling = (fabsf(data->acc.z) < freeFallThreshold && fabsf(data->acc.y) < freeFallThreshold && fabsf(data->acc.x) < freeFallThreshold);
+  // if (isFreeFalling) {
+  //   // Falling is OK, reset
+  //   this->initialTumbleTick = 0;
+  // }
 
   const bool isTilted = (data->acc.z < acceptedTiltAccZ);
   if(isTilted) {  // Will also be true for up side down
@@ -299,7 +299,7 @@ static void postTransitionActions(SupervisorMem_t* this, const supervisorState_t
 
   if (newState != supervisorStateReadyToFly &&
       newState != supervisorStateFlying &&
-      newState != supervisorStateWarningLevelOut &&
+      // newState != supervisorStateWarningLevelOut &&
       newState != supervisorStateLanded) {
     supervisorRequestArming(false);
   }
@@ -371,7 +371,7 @@ static supervisorConditionBits_t updateAndPopulateConditions(SupervisorMem_t* th
 
 static void updateLogData(SupervisorMem_t* this, const supervisorConditionBits_t conditions) {
   this->canFly = supervisorAreMotorsAllowedToRun();
-  this->isFlying = (this->state == supervisorStateFlying) || (this->state == supervisorStateWarningLevelOut);
+  this->isFlying = (this->state == supervisorStateFlying); //|| (this->state == supervisorStateWarningLevelOut);
   this->isTumbled = (conditions & SUPERVISOR_CB_IS_TUMBLED) != 0;
 
   this->infoBitfield = 0;
@@ -459,7 +459,7 @@ bool supervisorAreMotorsAllowedToRun() {
   SupervisorMem_t* this = &supervisorMem;
   return (this->state == supervisorStateReadyToFly) ||
          (this->state == supervisorStateFlying) ||
-         (this->state == supervisorStateWarningLevelOut) ||
+        //  (this->state == supervisorStateWarningLevelOut) ||
          (this->state == supervisorStateLanded);
 }
 
