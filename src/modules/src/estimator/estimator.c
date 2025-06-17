@@ -16,7 +16,7 @@
 #include "eventtrigger.h"
 #include "quatcompress.h"
 
-#define DEFAULT_ESTIMATOR StateEstimatorTypeComplementary
+#define DEFAULT_ESTIMATOR StateEstimatorTypeKalman
 static StateEstimatorType currentEstimator = StateEstimatorTypeAutoSelect;
 
 
