@@ -180,6 +180,11 @@ void attitudeControllerResetPitchAttitudePID(float pitchActual)
     pidReset(&pidPitch, pitchActual);
 }
 
+void attitudeControllerResetYawAttitudePID(float yawActual)
+{
+  pidReset(&pidYaw, yawActual);
+}
+
 void attitudeControllerResetAllPID(float rollActual, float pitchActual, float yawActual)
 {
   pidReset(&pidRoll, rollActual);

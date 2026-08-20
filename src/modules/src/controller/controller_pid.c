@@ -119,6 +119,10 @@ void controllerPid(control_t *control, const setpoint_t *setpoint,
       rateDesired.pitch = setpoint->attitudeRate.pitch;
       attitudeControllerResetPitchAttitudePID(state->attitude.pitch);
     }
+    if (setpoint->mode.yaw == modeVelocity) {
+      rateDesired.yaw = setpoint->attitudeRate.yaw;
+      attitudeControllerResetYawAttitudePID(state->attitude.yaw);
+    }
 
     // TODO: Investigate possibility to subtract gyro drift.
     attitudeControllerCorrectRatePID(sensors->gyro.x, -sensors->gyro.y, sensors->gyro.z,
