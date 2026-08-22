@@ -60,6 +60,39 @@ void controllerPid(control_t *control, const setpoint_t *setpoint,
 {
   control->controlMode = controlModeLegacy;
 
+  if (setpoint->mode.roll == modeMotorPwm) {
+    // Direct per-motor PWM setpoint (motorPwmDecoder in crtp_commander_generic.c):
+    // bypass the whole attitude/rate cascade and hand the four PWM ratios to
+    // power distribution as normalized forces in 0..1 (powerDistributionForce).
+    // The PWM values ride in thrust (M1) and attitudeRate roll/pitch/yaw (M2..M4).
+    const float pwm[STABILIZER_NR_OF_MOTORS] = {
+      setpoint->thrust,
+      setpoint->attitudeRate.roll,
+      setpoint->attitudeRate.pitch,
+      setpoint->attitudeRate.yaw,
+    };
+    control->controlMode = controlModeForce;
+    for (int i = 0; i < STABILIZER_NR_OF_MOTORS; i++) {
+      float ratio = pwm[i] / (float)UINT16_MAX;
+      if (ratio < 0.0f) { ratio = 0.0f; }
+      if (ratio > 1.0f) { ratio = 1.0f; }
+      control->normalizedForces[i] = ratio;
+    }
+
+    // Keep the PID cascade in a clean state so a later switch back to the
+    // legacy (CTBR) setpoint path starts without accumulated error.
+    actuatorThrust = 0;
+    attitudeControllerResetAllPID(state->attitude.roll, state->attitude.pitch, state->attitude.yaw);
+    positionControllerResetAllPID(state->position.x, state->position.y, state->position.z);
+    attitudeDesired.yaw = state->attitude.yaw;
+
+    cmd_thrust = pwm[0];
+    cmd_roll = pwm[1];
+    cmd_pitch = pwm[2];
+    cmd_yaw = pwm[3];
+    return;
+  }
+
   if (RATE_DO_EXECUTE(ATTITUDE_RATE, stabilizerStep)) {
     // Rate-controled YAW is moving YAW angle setpoint
     if (setpoint->mode.yaw == modeVelocity) {

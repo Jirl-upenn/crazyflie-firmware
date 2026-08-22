@@ -74,6 +74,7 @@ enum packet_type {
   velocityWorldType       = 8,
   zDistanceType           = 9,
   hoverType               = 10,
+  motorPwmType            = 11,
 };
 
 /* ---===== 2 - Decoding functions =====--- */
@@ -480,6 +481,43 @@ static void positionDecoder(setpoint_t *setpoint, uint8_t type, const void *data
   setpoint->attitude.yaw = values->yaw;
 }
 
+struct motorPwmPacket_s {
+  uint16_t pwm[4];    // PWM ratio per motor, index 0..3 = M1..M4, range 0..65535
+} __attribute__((packed));
+
+/* motorPwmDecoder
+ * Direct per-motor PWM command. Used for deploying RL racing policies: the host
+ * runs the policy and the motor mixer and sends the resulting per-motor
+ * throttle; no attitude/rate control runs onboard. The four values are carried
+ * in existing setpoint_t fields (thrust = M1, attitudeRate.roll = M2,
+ * attitudeRate.pitch = M3, attitudeRate.yaw = M4) and mode.roll/pitch/yaw =
+ * modeMotorPwm is the discriminator that makes controllerPid() bypass its PID
+ * cascade (see controller_pid.c). Position/velocity modes stay disabled.
+ *
+ * Fail-safe note: if this setpoint goes stale (> COMMANDER_WDT_TIMEOUT_STABILIZE)
+ * the supervisor rewrites roll/pitch to modeAbs/level and keeps thrust, i.e.
+ * the copter falls back to attitude hold at M1's PWM, then stops after
+ * COMMANDER_WDT_TIMEOUT_SHUTDOWN like any other setpoint.
+ */
+static void motorPwmDecoder(setpoint_t *setpoint, uint8_t type, const void *data, size_t datalen)
+{
+  const struct motorPwmPacket_s *values = data;
+
+  ASSERT(datalen == sizeof(struct motorPwmPacket_s));
+
+  setpoint->mode.x = modeDisable;
+  setpoint->mode.y = modeDisable;
+  setpoint->mode.z = modeDisable;
+  setpoint->mode.roll = modeMotorPwm;
+  setpoint->mode.pitch = modeMotorPwm;
+  setpoint->mode.yaw = modeMotorPwm;
+
+  setpoint->thrust = values->pwm[0];
+  setpoint->attitudeRate.roll = values->pwm[1];
+  setpoint->attitudeRate.pitch = values->pwm[2];
+  setpoint->attitudeRate.yaw = values->pwm[3];
+}
+
  /* ---===== 3 - packetDecoders array =====--- */
 const static packetDecoder_t packetDecoders[] = {
   [stopType]                = stopDecoder,
@@ -493,6 +531,7 @@ const static packetDecoder_t packetDecoders[] = {
   [velocityWorldType]       = velocityDecoder,
   [zDistanceType]           = zDistanceDecoder,
   [hoverType]               = hoverDecoder,
+  [motorPwmType]            = motorPwmDecoder,
 };
 
 /* Decoder switch */
