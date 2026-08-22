@@ -124,6 +124,10 @@ static void powerDistributionForceTorque(const control_t *control, motors_thrust
  * instead prioritizes stability rather than thrust.
  */
 static void powerDistributionForce(const control_t *control, motors_thrust_uncapped_t* motorThrustUncapped) {
+  // normalizedForces (0..1) are mapped linearly onto the 16-bit motor ratio.
+  // Also used by the direct per-motor PWM setpoint (modeMotorPwm, see
+  // controller_pid.c): the host has already done the mixing and the
+  // thrust->PWM conversion.
   for (int i = 0; i < STABILIZER_NR_OF_MOTORS; i++) {
     float f = control->normalizedForces[i];
 

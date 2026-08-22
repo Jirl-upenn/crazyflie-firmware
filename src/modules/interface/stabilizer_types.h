@@ -245,7 +245,8 @@ typedef union {
 typedef enum mode_e {
   modeDisable = 0,
   modeAbs,
-  modeVelocity
+  modeVelocity,
+  modeMotorPwm   // Direct per-motor PWM command (see motorPwmDecoder in crtp_commander_generic.c)
 } stab_mode_t;
 
 typedef struct {
