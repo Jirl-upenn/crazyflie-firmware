@@ -21,11 +21,11 @@ checks, in order of what would hurt most in the air:
   4. end to end — snapshot -> obs -> network -> clip -> decode in one C
      pass vs the same chain in numpy.
 
-Optionally --bag-npz FILE adds a fifth pass: mocap-derived snapshots from
-the WP0 baseline bag (keys: snapshots (N,17) float32, expected_act (N,4))
-through the full chain — the arrays are produced by
+Optionally --bag-npz FILE adds a fifth pass: the shadow policy's own
+observations from a real flight bag (keys: obs (N, OBS_DIM) float32,
+expected_act (N, 4) clipped) through the C network — produced by
 crazyflie-ros/bin/compare_shadow.py --export-snapshots once a baseline bag
-exists.
+exists. This closes the loop with observations a real flight produced.
 
 Exit code 0 = all parity bounds met.
 """
@@ -207,15 +207,11 @@ def main():
     check("end-to-end angles/thrustN", np.abs(full_c[:, :4] - full_np[:, :4]).max(), 5e-3)
     check("end-to-end pwm", np.abs(full_c[:, 4:] - full_np[:, 4:]).max(), 2.001)
 
-    # 5. optional: baseline-bag snapshots
+    # 5. optional: real-flight observations from the shadow's bag export
     if args.bag_npz is not None:
         bag = np.load(args.bag_npz)
-        payload = np.concatenate(
-            [bag["snapshots"], np.full((len(bag["snapshots"]), 1), 4.0)], axis=1)
-        run(exe, "full", payload, CMD_FLOATS)  # must at least run cleanly
-        obs_bag = run(exe, "obs", bag["snapshots"], int(C["NNPOL_OBS_DIM"]))
-        act_bag = run(exe, "policy", obs_bag, 4)
-        check("bag observations vs expected actions",
+        act_bag = run(exe, "policy", bag["obs"], 4)
+        check("bag observations vs shadow actions",
               np.abs(np.clip(act_bag, -1, 1) - bag["expected_act"]).max(), 1e-5)
 
     sys.exit(1 if failures else 0)
