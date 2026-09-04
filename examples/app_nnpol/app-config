@@ -1,0 +1,8 @@
+CONFIG_APP_ENABLE=y
+CONFIG_APP_PRIORITY=1
+# Words, not bytes. The app task runs the policy forward pass: two 128-float
+# hidden-activation buffers plus the 40-float observation live on its stack
+# (~1.4 KB), on top of FreeRTOS/printf overhead. 350 (the template default)
+# overflows; 1000 words = 4 KB leaves ~2.5x headroom.
+CONFIG_APP_STACKSIZE=1000
+CONFIG_CONTROLLER_OOT=y

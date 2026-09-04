@@ -1,0 +1,4 @@
+obj-y += nnpol_controller.o
+obj-y += nnpol_obs_lissajous.o
+obj-y += nnpol_action_mellinger.o
+obj-y += policy.o
