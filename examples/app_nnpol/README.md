@@ -12,8 +12,9 @@ crazyflie-ros' `exec: onboard` (branch `onboard`).
   With `nnpol.enable = 0` (default) the radio setpoint passes straight
   through to `controllerMellingerFirmware` — identical flight behaviour to
   `stabilizer.controller = 2`, which is validation step 1.
-- On every policy tick (`nnpol.ctrlHz`, compiled in from the checkpoint's
-  `ctrl_freq`) the controller snapshots the EKF state + gyro and notifies
+- On every policy tick (`nnpol.ctrlHz`, a writable param defaulting to the
+  checkpoint's `ctrl_freq`; the host pushes `policy.inference_hz` from
+  `config.yaml` before engaging) the controller snapshots the EKF state + gyro and notifies
   the app task, which builds the observation, runs the network
   (`policy.c`, weights `const` in flash), decodes the action into an
   attitude/thrust setpoint and publishes it into a sequence-locked buffer.
@@ -24,6 +25,12 @@ crazyflie-ros' `exec: onboard` (branch `onboard`).
   instantaneous, format-compatible takeover by that stream.
 - If the app task stops delivering actions, `nnpol.stale` counts and after
   5 policy periods the controller falls back to the radio setpoint.
+- The rate becomes a stabilizer tick divider (`1000 / ctrlHz`, integer) at
+  the `enable` rising edge, so only divisors of 1000 (100, 125, 200, 250,
+  500 ...) run exactly; a non-divisor runs at the next divisor up (48 ->
+  50 Hz) and read-only `nnpol.runHz` reports what actually engaged. The
+  curve clock is tick-based, so changing the rate never shifts the
+  reference in time — it only changes how often the network is stepped.
 
 ## Files
 
@@ -77,8 +84,9 @@ numpy transcriptions: network < 1e-5, observation < 2e-4, decode < 1e-3.
 
 Params (`nnpol.`): `enable` (u8, the engage switch), `startPhase` (s),
 `offX/offY/offZ` (m, the host's curve pin), `vnom` (V, thrust-map battery
-voltage) — all latched at the `enable` rising edge; read-only identity:
-`hash0-3`, `obsDim`, `actDim`, `ctrlHz`.
+voltage), `ctrlHz` (policy rate, default = trained `ctrl_freq`) — all
+latched at the `enable` rising edge; read-only: identity `hash0-3`,
+`obsDim`, `actDim`, and `runHz` (the rate the engaged run steps at).
 
 Logs (`nnpol.`): `t`, `act0-3` (clipped network output), `spRoll/Pitch/
 Yaw/Thrust` (decoded setpoint, deg + legacy thrust), `vbx/y/z`, `wbx/y/z`,
@@ -86,11 +94,12 @@ Yaw/Thrust` (decoded setpoint, deg + legacy thrust), `vbx/y/z`, `wbx/y/z`,
 
 ## Engage protocol (what the ROS side does)
 
-1. verify `nnpol.hash0-3` == the run dir's `firmware_export.json`, and
-   `nnpol.ctrlHz` == the checkpoint's `ctrl_freq`;
+1. verify `nnpol.hash0-3` == the run dir's `firmware_export.json` (the
+   hash covers the trained `ctrl_freq`), and that the configured
+   inference rate divides 1000;
 2. take off, hover at the curve's engage point, keep streaming
    `/attitude_cmd` (shadow);
-3. push `startPhase`, `offX/Y/Z` (from the host's pin), `vnom`;
+3. push `startPhase`, `offX/Y/Z` (from the host's pin), `vnom`, `ctrlHz`;
 4. set `enable = 1`, confirm by readback → onboard flight;
 5. abort/land: clear `enable` first — the host stream takes over on the
    next controller tick.

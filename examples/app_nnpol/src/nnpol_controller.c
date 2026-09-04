@@ -3,8 +3,8 @@
  *
  * Architecture (mjc_dronetests/docs/onboard_inference_plan.md section 3):
  * the OOT controller hook runs in the STABILIZER task at 1 kHz. On every
- * policy tick (RATE_DO_EXECUTE(NNPOL_CTRL_FREQ_HZ)) it snapshots the EKF
- * state + gyro and notifies the APP task, which builds the observation,
+ * policy tick (every RATE_MAIN_LOOP / nnpol.ctrlHz stabilizer ticks) it
+ * snapshots the EKF state + gyro and notifies the APP task, which builds the observation,
  * runs policyForward (0.3-0.8 ms — too close to the 1 ms stabilizer budget
  * to run inline, which is the whole reason for the task split), decodes
  * the action and publishes it into a sequence-locked buffer. The
@@ -25,9 +25,18 @@
  *
  * Engage protocol (the ground station's side is crazyflie-ros
  * `exec: onboard`): verify nnpol.hash0-3 against the run directory's
- * firmware_export.json, push startPhase/offX/offY/offZ/vnom, then set
- * enable = 1. The rising edge latches t0 and the pushed values, so the
+ * firmware_export.json, push startPhase/offX/offY/offZ/vnom/ctrlHz, then
+ * set enable = 1. The rising edge latches t0 and the pushed values, so the
  * curve clock starts at the engage instant with the host-pinned offset.
+ *
+ * Policy rate: nnpol.ctrlHz is WRITABLE and defaults to the checkpoint's
+ * trained ctrl_freq (NNPOL_CTRL_FREQ_HZ). The ground station pushes the
+ * configured inference rate before enable; the rising edge turns it into
+ * a tick divider (RATE_MAIN_LOOP / ctrlHz, integer), so only divisors of
+ * 1000 run exactly — anything else runs at the next divisor UP (48 -> 50
+ * Hz) and the read-only nnpol.runHz reports what actually engaged. The
+ * host validates divisibility before pushing; the observation's curve
+ * clock is tick-based, so a rate change never shifts the reference.
  *
  * Staleness: if the app task stops producing actions (overrun, crash),
  * the controller counts policy periods without a fresh sequence number.
@@ -87,7 +96,13 @@ static uint32_t paramHash2 = NNPOL_HASH2;
 static uint32_t paramHash3 = NNPOL_HASH3;
 static uint16_t paramObsDim = NNPOL_OBS_DIM;
 static uint16_t paramActDim = NNPOL_ACTION_DIM;
+
+/* Policy rate. Writable (the host's policy.inference_hz), defaulting to the
+ * trained rate; latched into a tick divider at the enable rising edge. */
 static uint16_t paramCtrlHz = NNPOL_CTRL_FREQ_HZ;
+/* Read-only: the rate the current/last engaged run actually steps at,
+ * RATE_MAIN_LOOP / divider. Differs from ctrlHz only for a non-divisor. */
+static uint16_t paramRunHz = NNPOL_CTRL_FREQ_HZ;
 
 // --------------------------------------------------------------------------
 // Stabilizer -> app task: the state snapshot (sequence lock)
@@ -237,6 +252,17 @@ static float activeOff[3] = { 0.0f, 0.0f, 0.0f };
 static uint32_t seqAtEngage = 0;      /* only actions newer than this fly */
 static uint32_t lastSeqSeen = 0;
 static uint16_t periodsWithoutFresh = 0;
+static uint32_t activeDivider = RATE_MAIN_LOOP / NNPOL_CTRL_FREQ_HZ;
+
+/** Stabilizer ticks per policy step for a requested rate: integer
+ * division, clamped to [1 Hz, RATE_MAIN_LOOP]. */
+static uint32_t tickDividerFor(uint16_t hz)
+{
+  uint32_t h = hz;
+  if (h < 1u) { h = 1u; }
+  if (h > RATE_MAIN_LOOP) { h = RATE_MAIN_LOOP; }
+  return RATE_MAIN_LOOP / h;
+}
 
 void controllerOutOfTreeInit()
 {
@@ -266,6 +292,8 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
     activeOff[0] = paramOffX;
     activeOff[1] = paramOffY;
     activeOff[2] = paramOffZ;
+    activeDivider = tickDividerFor(paramCtrlHz);
+    paramRunHz = (uint16_t)(RATE_MAIN_LOOP / activeDivider);
     nnpolAttitudeCmd_t unused;
     seqAtEngage = actionRead(&unused);
     lastSeqSeen = seqAtEngage;
@@ -274,7 +302,7 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
   }
   wasEnabled = enabled;
 
-  if (enabled && RATE_DO_EXECUTE(NNPOL_CTRL_FREQ_HZ, tick)) {
+  if (enabled && (tick % activeDivider) == 0u) {
     /* Policy tick: snapshot a consistent state and wake the app task.
      * The EKF quaternion is stored x, y, z, w; the observation wants
      * scalar-first — reordered here, sign-normalized in nnpolBuildObs. */
@@ -370,6 +398,11 @@ PARAM_ADD(PARAM_FLOAT, offY, &paramOffY)
 PARAM_ADD(PARAM_FLOAT, offZ, &paramOffZ)
 /** @brief Battery voltage the thrust map assumes (host parity, phase 1). */
 PARAM_ADD(PARAM_FLOAT, vnom, &paramVnom)
+/** @brief Policy rate (Hz) latched at the enable rising edge. Defaults to
+ * the checkpoint's trained ctrl_freq; must divide 1000 to run exactly. */
+PARAM_ADD(PARAM_UINT16, ctrlHz, &paramCtrlHz)
+/** @brief Rate (Hz) the engaged run actually steps at, read-only. */
+PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, runHz, &paramRunHz)
 /** @brief Policy identity (firmware_export.json hash words), read-only. */
 PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, hash0, &paramHash0)
 PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, hash1, &paramHash1)
@@ -377,7 +410,6 @@ PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, hash2, &paramHash2)
 PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, hash3, &paramHash3)
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, obsDim, &paramObsDim)
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, actDim, &paramActDim)
-PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, ctrlHz, &paramCtrlHz)
 PARAM_GROUP_STOP(nnpol)
 
 /**
