@@ -163,31 +163,26 @@ void powerDistribution(const control_t *control, motors_thrust_uncapped_t* motor
 
 bool powerDistributionCap(const motors_thrust_uncapped_t* motorThrustBatCompUncapped, motors_thrust_pwm_t* motorPwm)
 {
+  // Per-motor independent clipping - the behaviour upstream removed in
+  // d92c7205 ("Reduce power of all motors when limiting overload"),
+  // restored on this branch: each motor saturates to
+  // [idleThrust, UINT16_MAX] on its own, preserving collective thrust at
+  // the cost of attitude authority. Upstream's uniform-subtraction
+  // semantics (which prioritize attitude over thrust) live on the other
+  // branches; note crazyflow 510f3a6 models THOSE, so match each
+  // checkpoint to the branch its training plant corresponds to.
   const int32_t maxAllowedThrust = UINT16_MAX;
   bool isCapped = false;
 
-  // Find highest thrust
-  int32_t highestThrustFound = 0;
   for (int motorIndex = 0; motorIndex < STABILIZER_NR_OF_MOTORS; motorIndex++)
   {
-    const int32_t thrust = motorThrustBatCompUncapped->list[motorIndex];
-    if (thrust > highestThrustFound)
+    int32_t thrust = motorThrustBatCompUncapped->list[motorIndex];
+    if (thrust > maxAllowedThrust)
     {
-      highestThrustFound = thrust;
+      thrust = maxAllowedThrust;
+      isCapped = true;
     }
-  }
-
-  int32_t reduction = 0;
-  if (highestThrustFound > maxAllowedThrust)
-  {
-    reduction = highestThrustFound - maxAllowedThrust;
-    isCapped = true;
-  }
-
-  for (int motorIndex = 0; motorIndex < STABILIZER_NR_OF_MOTORS; motorIndex++)
-  {
-    int32_t thrustCappedUpper = motorThrustBatCompUncapped->list[motorIndex] - reduction;
-    motorPwm->list[motorIndex] = capMinThrust(thrustCappedUpper, powerDistributionGetIdleThrust());
+    motorPwm->list[motorIndex] = capMinThrust(thrust, powerDistributionGetIdleThrust());
   }
 
   return isCapped;
