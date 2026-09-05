@@ -36,6 +36,16 @@
 
 #include "nnpol_slot.h"
 
+/** RACE_V3: the track as the host pinned it for this run (nnpol.g*,
+ * pushed at engage) and the gate the policy is targeting, advanced by the
+ * controller with nnpolRaceUpdateGate on every policy tick. */
+typedef struct {
+  uint8_t nGates;                         /**< gates in use, <= NNPOL_MAX_GATES */
+  uint8_t gateIdx;                        /**< current target gate */
+  float gates[NNPOL_MAX_GATES][3];        /**< world positions, m */
+  float normals[NNPOL_MAX_GATES][3];      /**< unit approach axes, against travel, horizontal */
+} nnpolRaceTrack_t;
+
 /** Everything the observation is a function of, snapshotted on one
  * stabilizer tick so the app task computes from a consistent state. */
 typedef struct {
@@ -53,6 +63,7 @@ typedef struct {
                             held through ESC dropouts (the host's
                             set_motor_rpm hold); 1.0 = hover before the
                             first reading */
+  nnpolRaceTrack_t race; /**< RACE_V3: the pinned track and the target gate */
 } nnpolSnapshot_t;
 
 /** One decoded command, every stage kept for logging and host parity.
@@ -98,6 +109,15 @@ void nnpolRef(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap, float t
  * builder for it (or it would exceed NNPOL_MAX_OBS_DIM). Equal to
  * hdr->obsDim for a usable slot. */
 int nnpolObsDim(const nnpolSlotHeader_t* hdr);
+
+/** RACE_V3 (nnpol_obs_race.c): the gate-crossing test of RacePlugin.step,
+ * run once per policy tick with the current position; advances *gateIdx
+ * and maintains *prevGateX (re-armed to 1.0 on a crossing, as at reset). */
+void nnpolRaceUpdateGate(const nnpolRaceTrack_t* track, float gateSide, const float pos[3],
+                         uint8_t* gateIdx, float* prevGateX);
+int nnpolRaceObsDim(const nnpolSlotHeader_t* hdr);
+int nnpolRaceBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
+                      float obs[NNPOL_MAX_OBS_DIM]);
 
 /** The observation the header's taskId names, into obs (at most
  * NNPOL_MAX_OBS_DIM floats). Returns the number written, which the caller

@@ -42,8 +42,11 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
   keepalive and shadow reference; clearing `nnpol.enable` mid-flight is an
   instantaneous, format-compatible takeover by that stream.
 - Observations: `traj_lissajous` (the fixed eight, constants in the slot
-  header) and `traj_easy` (the run's curve pushed at engage as `nnpol.c*`),
-  each with `body` or `body_motorobs` — the latter appends the four
+  header), `traj_easy` (the run's curve pushed at engage as `nnpol.c*`)
+  and `race` / `race_random` v3 (the run's pinned track pushed at engage
+  as `nnpol.nGates` / `gate0` / `g<i>x..g<i>nz`, up to 8 gates; the
+  controller runs the gate-crossing test on every policy tick and logs
+  `nnpol.gateIdx`), each with or without the `motorobs` tail — the four
   rotor speeds the app reads from its own bidirectional-DSHOT telemetry
   (`motorsGetRPM`), held through dropouts from a hover start and
   normalized by 15896.3 exactly as the host's `set_motor_rpm` does.
@@ -65,6 +68,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 | `src/nnpol_slot.h` / `nnpol_slot_format.c` | the blob format and its validation (pure C, host-testable) |
 | `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh (pure C) |
 | `src/nnpol_obs_lissajous.c` | the Lissajous-family body observations: the fixed eight or a pushed per-run curve (traj_easy), with the yaw anchor and the optional rotor-speed tail (pure C) |
+| `src/nnpol_obs_race.c` | the race v3 observation on the pushed pinned track, and the gate-crossing test (pure C) |
 | `src/nnpol_action.c` | action decode for all three kinds from the header's constants (pure C) |
 | `test/` | host parity harness (plain gcc) + python runner, driven by a run directory's `policy_slot.bin` |
 
@@ -113,6 +117,7 @@ path. `--bag-npz` adds mocap-derived snapshots from a flight bag.
 Params (`nnpol.`): `enable` (u8, the engage switch), `startPhase` (s),
 `offX/offY/offZ` (m, the host's curve pin), `yaw0` (rad, the run's yaw
 anchor), `cAmp0-2/cOmg0-2/cPh0-2/cCen0-2/cYaw` (a traj_easy run's curve),
+`nGates`, `gate0`, `g0x..g7nz` (a race run's pinned track),
 `vnom` (V, thrust-map battery voltage), `rpmScale` (MOTOR kind's
 rpm multiplier), `ctrlHz` (policy rate, default = the slot's `ctrl_freq`)
 — all latched at the `enable` rising edge; `slot` (select), `slotErase`;
@@ -124,7 +129,7 @@ Logs (`nnpol.`): `t`, `act0-3` (clipped network output), `spRoll/Pitch/
 Yaw/Thrust` (decoded setpoint in the host's wire units: deg or deg/s, +
 legacy thrust), `pwm0-3` (MOTOR kind's per-motor PWM), `vbx/y/z`,
 `wbx/y/z`, `e0x/y/z` (observation excerpts), `us` (inference time),
-`stale`, `obsErr`, `seq`.
+`stale`, `obsErr`, `gateIdx`, `seq`.
 
 ## Engage protocol (what the ROS side does)
 
@@ -135,7 +140,8 @@ legacy thrust), `pwm0-3` (MOTOR kind's per-motor PWM), `vbx/y/z`,
 2. take off, hover at the curve's engage point, keep streaming the
    checkpoint's command topic (shadow);
 3. push `startPhase`, `offX/Y/Z`, `yaw0` (from the host's pin and
-   anchor), the curve (`c*`, traj_easy only), `vnom`, `rpmScale`, `ctrlHz`;
+   anchor), the curve (`c*`, traj_easy) or the track (`nGates`/`gate0`/`g*`,
+   race), `vnom`, `rpmScale`, `ctrlHz`;
 4. set `enable = 1`, confirm by readback → onboard flight;
 5. abort/land: clear `enable` first — the host stream takes over on the
    next controller tick.

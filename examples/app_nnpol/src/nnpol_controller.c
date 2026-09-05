@@ -130,6 +130,15 @@ static float activeCurve[NNPOL_CURVE_FLOATS] = { 0 };
  * (1.0) — a state a flying drone is in, unlike zero — and holds through
  * DSHOT telemetry dropouts, exactly as the host's set_motor_rpm does. */
 static float heldRpm[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+/* RACE_V3: the track as pinned by the host (nnpol.g*), the first target
+ * gate (nnpol.gate0) — latched at the rising edge — and the gate state the
+ * stabilizer advances every policy tick (RacePlugin.step's crossing test). */
+static uint8_t paramNGates = 0;
+static uint8_t paramGate0 = 0;
+static float paramGates[NNPOL_MAX_GATES][6];   /* x y z nx ny nz per gate */
+static nnpolRaceTrack_t activeTrack;
+static float racePrevGateX = 1.0f;
+static uint8_t logGateIdx = 0;
 
 /* Policy rate. Writable (the host's policy.inference_hz), defaulting to the
  * selected slot's trained rate; latched into a tick divider at the enable
@@ -482,6 +491,17 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
     activeYaw0 = paramYaw0;
     activeRpmScale = paramRpmScale;
     memcpy(activeCurve, paramCurve, sizeof(activeCurve));
+    /* The race track and its state: gate_idx = initial_gate, prev_gate_x
+     * = 1.0, as RacePlugin.reset_task_state / RaceV3.reset. */
+    activeTrack.nGates = paramNGates > NNPOL_MAX_GATES ? NNPOL_MAX_GATES : paramNGates;
+    for (int i = 0; i < NNPOL_MAX_GATES; i++) {
+      for (int k = 0; k < 3; k++) {
+        activeTrack.gates[i][k] = paramGates[i][k];
+        activeTrack.normals[i][k] = paramGates[i][3 + k];
+      }
+    }
+    activeTrack.gateIdx = activeTrack.nGates ? (uint8_t)(paramGate0 % activeTrack.nGates) : 0;
+    racePrevGateX = 1.0f;
     activeDivider = tickDividerFor(paramCtrlHz);
     paramRunHz = (uint16_t)(RATE_MAIN_LOOP / activeDivider);
     nnpolCmd_t unused;
@@ -518,6 +538,15 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
     snap.gyro_deg[2] = sensors->gyro.z;
     snap.yaw0 = activeYaw0;
     memcpy(snap.curve, activeCurve, sizeof(snap.curve));
+    /* Race gate state, advanced with the EKF position (the host advances
+     * its shadow copy with mocap): the crossing test costs a dot product
+     * and runs here so the app task sees one consistent gate per tick. */
+    if (activeValid && activePolicy.hdr->taskId == NNPOL_TASK_RACE_V3) {
+      nnpolRaceUpdateGate(&activeTrack, activePolicy.hdr->task[NNPOL_TASK_GATE_SIDE],
+                          snap.pos, &activeTrack.gateIdx, &racePrevGateX);
+      logGateIdx = activeTrack.gateIdx;
+    }
+    snap.race = activeTrack;
     /* Bidirectional-DSHOT rotor speed (motors.c): UINT16_MAX = invalid or
      * no reply, held per motor. Read on every policy tick regardless of the
      * slot's observation so the hold is warm when a motorobs slot engages. */
@@ -657,6 +686,60 @@ PARAM_ADD(PARAM_FLOAT, cCen0, &paramCurve[9])
 PARAM_ADD(PARAM_FLOAT, cCen1, &paramCurve[10])
 PARAM_ADD(PARAM_FLOAT, cCen2, &paramCurve[11])
 PARAM_ADD(PARAM_FLOAT, cYaw, &paramCurve[12])
+/** @brief race: the track as the host pinned it for this run (RaceV3
+ * .pin_start_gate): gates in use, the first target gate, and per gate the
+ * world position (m) and unit approach normal. Latched at the enable
+ * rising edge; ignored by the trajectory slots. */
+PARAM_ADD(PARAM_UINT8, nGates, &paramNGates)
+PARAM_ADD(PARAM_UINT8, gate0, &paramGate0)
+PARAM_ADD(PARAM_FLOAT, g0x, &paramGates[0][0])
+PARAM_ADD(PARAM_FLOAT, g0y, &paramGates[0][1])
+PARAM_ADD(PARAM_FLOAT, g0z, &paramGates[0][2])
+PARAM_ADD(PARAM_FLOAT, g0nx, &paramGates[0][3])
+PARAM_ADD(PARAM_FLOAT, g0ny, &paramGates[0][4])
+PARAM_ADD(PARAM_FLOAT, g0nz, &paramGates[0][5])
+PARAM_ADD(PARAM_FLOAT, g1x, &paramGates[1][0])
+PARAM_ADD(PARAM_FLOAT, g1y, &paramGates[1][1])
+PARAM_ADD(PARAM_FLOAT, g1z, &paramGates[1][2])
+PARAM_ADD(PARAM_FLOAT, g1nx, &paramGates[1][3])
+PARAM_ADD(PARAM_FLOAT, g1ny, &paramGates[1][4])
+PARAM_ADD(PARAM_FLOAT, g1nz, &paramGates[1][5])
+PARAM_ADD(PARAM_FLOAT, g2x, &paramGates[2][0])
+PARAM_ADD(PARAM_FLOAT, g2y, &paramGates[2][1])
+PARAM_ADD(PARAM_FLOAT, g2z, &paramGates[2][2])
+PARAM_ADD(PARAM_FLOAT, g2nx, &paramGates[2][3])
+PARAM_ADD(PARAM_FLOAT, g2ny, &paramGates[2][4])
+PARAM_ADD(PARAM_FLOAT, g2nz, &paramGates[2][5])
+PARAM_ADD(PARAM_FLOAT, g3x, &paramGates[3][0])
+PARAM_ADD(PARAM_FLOAT, g3y, &paramGates[3][1])
+PARAM_ADD(PARAM_FLOAT, g3z, &paramGates[3][2])
+PARAM_ADD(PARAM_FLOAT, g3nx, &paramGates[3][3])
+PARAM_ADD(PARAM_FLOAT, g3ny, &paramGates[3][4])
+PARAM_ADD(PARAM_FLOAT, g3nz, &paramGates[3][5])
+PARAM_ADD(PARAM_FLOAT, g4x, &paramGates[4][0])
+PARAM_ADD(PARAM_FLOAT, g4y, &paramGates[4][1])
+PARAM_ADD(PARAM_FLOAT, g4z, &paramGates[4][2])
+PARAM_ADD(PARAM_FLOAT, g4nx, &paramGates[4][3])
+PARAM_ADD(PARAM_FLOAT, g4ny, &paramGates[4][4])
+PARAM_ADD(PARAM_FLOAT, g4nz, &paramGates[4][5])
+PARAM_ADD(PARAM_FLOAT, g5x, &paramGates[5][0])
+PARAM_ADD(PARAM_FLOAT, g5y, &paramGates[5][1])
+PARAM_ADD(PARAM_FLOAT, g5z, &paramGates[5][2])
+PARAM_ADD(PARAM_FLOAT, g5nx, &paramGates[5][3])
+PARAM_ADD(PARAM_FLOAT, g5ny, &paramGates[5][4])
+PARAM_ADD(PARAM_FLOAT, g5nz, &paramGates[5][5])
+PARAM_ADD(PARAM_FLOAT, g6x, &paramGates[6][0])
+PARAM_ADD(PARAM_FLOAT, g6y, &paramGates[6][1])
+PARAM_ADD(PARAM_FLOAT, g6z, &paramGates[6][2])
+PARAM_ADD(PARAM_FLOAT, g6nx, &paramGates[6][3])
+PARAM_ADD(PARAM_FLOAT, g6ny, &paramGates[6][4])
+PARAM_ADD(PARAM_FLOAT, g6nz, &paramGates[6][5])
+PARAM_ADD(PARAM_FLOAT, g7x, &paramGates[7][0])
+PARAM_ADD(PARAM_FLOAT, g7y, &paramGates[7][1])
+PARAM_ADD(PARAM_FLOAT, g7z, &paramGates[7][2])
+PARAM_ADD(PARAM_FLOAT, g7nx, &paramGates[7][3])
+PARAM_ADD(PARAM_FLOAT, g7ny, &paramGates[7][4])
+PARAM_ADD(PARAM_FLOAT, g7nz, &paramGates[7][5])
 /** @brief Battery voltage every thrust/rpm-to-PWM map assumes (host parity). */
 PARAM_ADD(PARAM_FLOAT, vnom, &paramVnom)
 /** @brief MOTOR kind: rpm multiplier before the PWM map (host motor_pwm.rpm_scale). */
@@ -741,6 +824,8 @@ LOG_ADD(LOG_UINT16, stale, &logStale)
 /** @brief Observations refused since engage (no builder for the slot's
  * task, or a dimension mismatch) — each one is a missed action. */
 LOG_ADD(LOG_UINT16, obsErr, &logObsErr)
+/** @brief race: the gate the onboard crossing test is targeting. */
+LOG_ADD(LOG_UINT8, gateIdx, &logGateIdx)
 /** @brief Actions computed since boot. */
 LOG_ADD(LOG_UINT32, seq, &logSeq)
 LOG_GROUP_STOP(nnpol)

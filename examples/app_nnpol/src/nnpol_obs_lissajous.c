@@ -125,6 +125,9 @@ static void quatMul(const float a[4], const float b[4], float out[4])
 
 int nnpolObsDim(const nnpolSlotHeader_t* hdr)
 {
+  if (hdr->taskId == NNPOL_TASK_RACE_V3) {
+    return nnpolRaceObsDim(hdr);
+  }
   if (hdr->taskId != NNPOL_TASK_LISSAJOUS_BODY && hdr->taskId != NNPOL_TASK_EASY_BODY) {
     return 0;
   }
@@ -139,6 +142,9 @@ int nnpolObsDim(const nnpolSlotHeader_t* hdr)
 int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
                   float obs[NNPOL_MAX_OBS_DIM])
 {
+  if (hdr->taskId == NNPOL_TASK_RACE_V3) {
+    return nnpolRaceBuildObs(hdr, snap, obs);
+  }
   const int dim = nnpolObsDim(hdr);
   if (dim == 0) {
     return 0;

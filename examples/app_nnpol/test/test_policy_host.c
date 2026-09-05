@@ -15,12 +15,15 @@
  * Modes; all records are little-endian float32 streams:
  *   info   : prints "status obsDim actionDim numLayers kind mixer taskId ctrlHz"
  *   policy : obs[obsDim]                          -> act[4]   (raw, unclipped)
- *   obs    : snapshot[35]                         -> obs[obsDim]
+ *   obs    : snapshot[85]                         -> obs[obsDim]
  *   act    : action[4], vnom, rpmScale, yaw0      -> cmd[14]
- *   full   : snapshot[35], vnom, rpmScale         -> cmd[14]  (obs -> net -> clip -> decode)
+ *   full   : snapshot[85], vnom, rpmScale         -> cmd[14]  (obs -> net -> clip -> decode)
+ *   gate   : pos(3), gateSide, gateIdx, prevGateX, nGates, gates(8x3), normals(8x3)
+ *                                                 -> [gateIdx, prevGateX] (one crossing-test step)
  *
- * snapshot[35] = [t, off(3), pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), yaw0,
- *                 curve(13: amp3 omega3 phase3 center3 yaw), rpm_norm(4)]
+ * snapshot[85] = [t, off(3), pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), yaw0,
+ *                 curve(13: amp3 omega3 phase3 center3 yaw), rpm_norm(4),
+ *                 race: nGates, gateIdx, gates(8 x 3), normals(8 x 3)]
  * cmd[14]      = [ch0, ch1, ch2, thrustN, thrustPwm, thrustSetpoint,
  *                 rpm(4), motorPwm(4)]   — nnpolCmd_t flattened; which
  *                 columns are non-zero depends on the slot's actionKind
@@ -31,7 +34,7 @@
 
 #include "nnpol.h"
 
-#define SNAP_FLOATS 35
+#define SNAP_FLOATS 85
 #define CMD_FLOATS 14
 #define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 3)
 #define SLOT_CAPACITY 0x20000u
@@ -49,6 +52,12 @@ static void unpackSnapshot(const float* in, nnpolSnapshot_t* s)
   s->yaw0 = in[17];
   memcpy(s->curve, in + 18, NNPOL_CURVE_FLOATS * sizeof(float));
   memcpy(s->rpm, in + 31, 4 * sizeof(float));
+  s->race.nGates = (uint8_t)in[35];
+  s->race.gateIdx = (uint8_t)in[36];
+  for (int i = 0; i < NNPOL_MAX_GATES; i++) {
+    memcpy(s->race.gates[i], in + 37 + 3 * i, 3 * sizeof(float));
+    memcpy(s->race.normals[i], in + 61 + 3 * i, 3 * sizeof(float));
+  }
 }
 
 static void packCmd(const nnpolCmd_t* c, float* out)
@@ -125,6 +134,24 @@ int main(int argc, char** argv)
         return 1;
       }
       fwrite(obs, sizeof(float), obsDim, stdout);
+    }
+  } else if (strcmp(mode, "gate") == 0) {
+    float in[7 + 6 * NNPOL_MAX_GATES], out[2];
+    const size_t nin = 7 + 6 * NNPOL_MAX_GATES;
+    while (fread(in, sizeof(float), nin, stdin) == nin) {
+      nnpolRaceTrack_t track;
+      track.nGates = (uint8_t)in[6];
+      uint8_t gateIdx = (uint8_t)in[4];
+      float prevGateX = in[5];
+      for (int i = 0; i < NNPOL_MAX_GATES; i++) {
+        memcpy(track.gates[i], in + 7 + 3 * i, 3 * sizeof(float));
+        memcpy(track.normals[i], in + 7 + 3 * NNPOL_MAX_GATES + 3 * i, 3 * sizeof(float));
+      }
+      track.gateIdx = gateIdx;
+      nnpolRaceUpdateGate(&track, in[3], in, &gateIdx, &prevGateX);
+      out[0] = (float)gateIdx;
+      out[1] = prevGateX;
+      fwrite(out, sizeof(float), 2, stdout);
     }
   } else if (strcmp(mode, "act") == 0) {
     float in[ACT_IN_FLOATS], out[CMD_FLOATS];
