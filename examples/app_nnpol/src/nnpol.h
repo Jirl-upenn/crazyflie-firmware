@@ -46,6 +46,13 @@ typedef struct {
   float vel_w[3];      /**< world-frame linear velocity, m/s */
   float gyro_deg[3];   /**< body rates, deg/s */
   float yaw0;          /**< yaw anchor, rad (nnpol.yaw0, pushed at engage) */
+  float curve[NNPOL_CURVE_FLOATS]; /**< EASY_BODY: this run's curve (nnpol.c*,
+                                    pushed at engage): amp(3), omega(3),
+                                    phase(3), center(3), yaw */
+  float rpm[4];        /**< measured rotor speeds M1..M4 / NOMINAL_HOVER_RPM,
+                            held through ESC dropouts (the host's
+                            set_motor_rpm hold); 1.0 = hover before the
+                            first reading */
 } nnpolSnapshot_t;
 
 /** One decoded command, every stage kept for logging and host parity.
@@ -82,9 +89,15 @@ typedef struct {
 } nnpolPolicy_t;
 
 /** Reference position at time t (seconds), world frame, BEFORE the yaw
- * anchor and the pushed offset — the tasks/traj_lissajous figure-eight
- * with the header's constants. */
-void nnpolRef(const nnpolSlotHeader_t* hdr, float t, float out[3]);
+ * anchor and the pushed offset: the fixed figure-eight from the header's
+ * constants (LISSAJOUS_BODY) or this run's curve from the snapshot
+ * (EASY_BODY). */
+void nnpolRef(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap, float t, float out[3]);
+
+/** The width the header's taskId/task[] build, 0 when this build has no
+ * builder for it (or it would exceed NNPOL_MAX_OBS_DIM). Equal to
+ * hdr->obsDim for a usable slot. */
+int nnpolObsDim(const nnpolSlotHeader_t* hdr);
 
 /** The observation the header's taskId names, into obs (at most
  * NNPOL_MAX_OBS_DIM floats). Returns the number written, which the caller

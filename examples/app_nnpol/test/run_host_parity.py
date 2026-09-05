@@ -48,12 +48,14 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 
-SNAP_FLOATS = 18
+SNAP_FLOATS = 35   # + curve(13) + rpm(4), see test_policy_host.c
+NOMINAL_HOVER_RPM = 15896.296489245326
 CMD_FLOATS = 14   # nnpolCmd_t flattened, see test_policy_host.c
 VNOM = 4.0
 RPM_SCALE = 1.0
 KIND_MELLINGER, KIND_CTBR, KIND_MOTOR = 0, 1, 2
 TASK_LISSAJOUS_BODY = 0
+TASK_EASY_BODY = 1
 
 # nnpol_slot.h, mirrored (export_policy_c._SLOT_HEADER_FORMAT).
 HEADER_FORMAT = "<4I4I4H5HH4H4f4f3f3f2f8f64sI32s"
@@ -93,7 +95,7 @@ def parse_header(blob):
         "NNPOL_RPM2THRUST_A2": rpm2thrust[2],
         "NNPOL_VMOTOR2RPM_K0": vmotor2rpm[0], "NNPOL_VMOTOR2RPM_K1": vmotor2rpm[1],
         "NNPOL_T_PERIOD_S": task[0], "NNPOL_AMPLITUDE_M": task[1], "NNPOL_CENTER_Z_M": task[2],
-        "NNPOL_N_SAMPLES": task[3], "NNPOL_SAMPLES_DT_S": task[4],
+        "NNPOL_N_SAMPLES": task[3], "NNPOL_SAMPLES_DT_S": task[4], "motorobs": task[6] != 0.0,
     }
 
 
@@ -140,9 +142,16 @@ def rot_z(a):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-def np_ref(t, C):
-    w = 2.0 * np.pi / C["NNPOL_T_PERIOD_S"]
+def np_ref(t, C, curve=None):
+    """controller_trajectory.ref for an EASY slot (the pushed curve), the
+    fixed eight otherwise."""
     t = np.asarray(t)
+    if C["task_id"] == TASK_EASY_BODY:
+        amp, omega, phase, center, yaw = (curve[0:3], curve[3:6], curve[6:9], curve[9:12],
+                                          float(curve[12]))
+        local = amp * np.sin(omega * t[..., None] + phase)
+        return local @ rot_z(yaw).T + center
+    w = 2.0 * np.pi / C["NNPOL_T_PERIOD_S"]
     return np.stack([C["NNPOL_AMPLITUDE_M"] * np.sin(w * t),
                      np.zeros_like(t),
                      0.5 * C["NNPOL_AMPLITUDE_M"] * np.sin(2 * w * t)
@@ -154,13 +163,16 @@ def np_obs(snap, C):
     body velocity and rate, lookahead of the curve yawed by R_tw."""
     t, off, pos = snap[0], snap[1:4], snap[4:7]
     q, v_w, gyro, yaw0 = snap[7:11].copy(), snap[11:14], snap[14:17], snap[17]
+    curve, rpm = snap[18:31], snap[31:35]
     R = quat_to_R(q / np.linalg.norm(q))
     R_tw = rot_z(yaw0)
     n = int(C["NNPOL_N_SAMPLES"])
     ts = t + np.arange(n) * C["NNPOL_SAMPLES_DT_S"]
-    e_w = np_ref(ts, C) @ R_tw.T + off - pos
-    return np.concatenate([R_to_quat_wxyz(R_tw.T @ R), R.T @ v_w, np.radians(gyro),
-                           (e_w @ R).reshape(-1)])
+    e_w = np_ref(ts, C, curve) @ R_tw.T + off - pos
+    parts = [R_to_quat_wxyz(R_tw.T @ R), R.T @ v_w, np.radians(gyro), (e_w @ R).reshape(-1)]
+    if C["motorobs"]:
+        parts.append(rpm)   # TrajEasyBodyMotor.observe: the held, normalized speeds
+    return np.concatenate(parts)
 
 
 def np_rpm_to_pwm(rpm, vnom, C):
@@ -232,12 +244,23 @@ def random_snapshots(rng, n, C):
     attitude/velocity, the pushed offset spanning a few metres, a yaw
     anchor anywhere on the circle."""
     snaps = np.zeros((n, SNAP_FLOATS), dtype=np.float32)
-    snaps[:, 0] = rng.uniform(0, 3 * C["NNPOL_T_PERIOD_S"], n)          # t
+    snaps[:, 0] = rng.uniform(0, 3 * (C["NNPOL_T_PERIOD_S"] or 16.0), n) # t
     snaps[:, 1:4] = rng.uniform(-3, 3, (n, 3))                          # off
     snaps[:, 17] = rng.uniform(-np.pi, np.pi, n)                        # yaw0
     snaps[::4, 17] = 0.0                                                # and unanchored runs
+    # a per-run curve like controller_trajectory.sample draws: amplitudes,
+    # harmonics 1-2 of an 8-16 s period, phases, centre height, yaw
+    T = rng.uniform(8.0, 16.0, n)
+    harm = rng.integers(1, 3, (n, 3))
+    snaps[:, 18:21] = np.stack([rng.uniform(0.2, 1.0, n), rng.uniform(0.2, 1.0, n),
+                                rng.uniform(0.0, 0.5, n)], axis=1)    # amp
+    snaps[:, 21:24] = harm * (2.0 * np.pi / T)[:, None]                 # omega
+    snaps[:, 24:27] = rng.uniform(0.0, 2.0 * np.pi, (n, 3))            # phase
+    snaps[:, 27:30] = np.stack([np.zeros(n), np.zeros(n), rng.uniform(0.8, 1.2, n)], axis=1)
+    snaps[:, 30] = rng.uniform(-np.pi, np.pi, n)                        # curve yaw
+    snaps[:, 31:35] = rng.uniform(0.6, 1.4, (n, 4))                     # rpm / nominal
     for i in range(n):
-        ref0 = np_ref(snaps[i, 0], C) @ rot_z(snaps[i, 17]).T + snaps[i, 1:4]
+        ref0 = np_ref(snaps[i, 0], C, snaps[i, 18:31]) @ rot_z(snaps[i, 17]).T + snaps[i, 1:4]
         snaps[i, 4:7] = ref0 + rng.uniform(-0.5, 0.5, 3)                # pos
     q = rng.normal(size=(n, 4))
     q /= np.linalg.norm(q, axis=1, keepdims=True)
@@ -316,7 +339,7 @@ def main():
     act = run(exe, blob_path, "policy", ref["obs"], 4)
     check("network vs policy_reference.npz", np.abs(act - ref["act_raw"]).max(), 1e-5)
 
-    if C["task_id"] != TASK_LISSAJOUS_BODY:
+    if C["task_id"] not in (TASK_LISSAJOUS_BODY, TASK_EASY_BODY):
         print("[skip] observation/end-to-end: no host mirror for task id %d" % C["task_id"])
         snaps = obs_np = None
     else:

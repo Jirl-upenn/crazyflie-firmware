@@ -1,29 +1,43 @@
 /**
- * nnpol_obs_lissajous.c — the traj_lissajous/body observation, transcribed
- * from the trainer (tasks/traj_lissajous/observations.py _BodyFrame) via
- * the deployed host implementation (crazyflie-ros controller_tasks.py
- * TrajLissajousBody.observe). Pure C: host-testable, no firmware includes.
+ * nnpol_obs_lissajous.c — the Lissajous-family body observations,
+ * transcribed from the trainer (tasks/traj_lissajous/observations.py
+ * _BodyFrame / _BodyFrameMotor and their tasks/traj_easy twins) via the
+ * deployed host implementation (crazyflie-ros controller_tasks.py
+ * TrajLissajousBody / TrajEasyBody / TrajEasyBodyMotor.observe). Pure C:
+ * host-testable, no firmware includes.
  *
- * Observation layout (obsDim = 10 + 3 * n_samples):
+ * Observation layout (obsDim = 10 + 3 * n_samples [+ 4]):
  *
  *     [quat_wxyz(4), v_B(3), omega_B(3),
- *      e_B(n_samples x 3, row-major)]
+ *      e_B(n_samples x 3, row-major)
+ *      [, rotor_speed(4) / NOMINAL_HOVER_RPM]]
  *
  * where e_B[k] = R^T (R_tw ref(t + k*samples_dt) + off - pos): the
  * body-frame offsets to the next lookahead points, offsets starting at 0
  * (the CURRENT reference point is included — the trainer's sample_offsets
  * = arange(n) * dt, unlike tasks/traj whose window starts at t+dt).
  *
- * Yaw anchor (TrajLissajousBody.anchor, YAW_ANCHORED): R_tw = rot_z(yaw0)
- * rotates the task frame — the trainer's world, where every episode starts
- * at yaw 0 — into the mocap frame. The curve is yawed by it (the host's
- * pushed offset already places the yawed curve at the engage point) and
- * the observed attitude is R_tw^T R_wb, i.e. relative to the engage
- * heading. v_B, omega_B and e_B are body-frame already and need nothing.
+ * Two curve sources, by the header's taskId:
+ *   LISSAJOUS_BODY  the paper's fixed figure-eight from the header's task[]
+ *                   constants (period, amplitude, centre height).
+ *   EASY_BODY       tasks/traj_easy: one member of the general family,
+ *                   drawn per RUN by the host (controller_trajectory.sample
+ *                   / fixed) and pushed at engage as nnpol.c* — amp(3),
+ *                   omega(3), phase(3), center(3), yaw:
+ *                   ref(t) = rot_z(yaw) (amp * sin(omega t + phase)) + center.
+ * task[NNPOL_TASK_MOTOROBS] != 0 appends the four measured rotor speeds,
+ * normalized by the trainer's NOMINAL_HOVER_RPM (the same 15896.3 tasks/
+ * traj, race and both lissajous tasks use); the values arrive in the
+ * snapshot already held-through-dropouts by the controller, as the host's
+ * TaskObs.set_motor_rpm holds them.
  *
- * The curve constants (period, amplitude, centre height, n_samples,
- * samples_dt) come from the slot header's task[] block, so the same
- * build serves every lissajous checkpoint.
+ * Yaw anchor (TrajLissajousBody.anchor, YAW_ANCHORED, both tasks): R_tw =
+ * rot_z(yaw0) rotates the task frame — the trainer's world, where every
+ * episode starts at yaw 0 — into the mocap frame. The curve is yawed by it
+ * (the host's pushed offset already places the yawed curve at the engage
+ * point) and the observed attitude is R_tw^T R_wb, i.e. relative to the
+ * engage heading. v_B, omega_B, e_B and rotor speeds are body-frame
+ * already and need nothing.
  *
  * The quaternion sign is normalized to w >= 0 AFTER the anchor rotation,
  * as the host's _quat_wxyz does. The trainer's quaternions come from
@@ -34,15 +48,43 @@
 
 #include "nnpol.h"
 
-/* task[] indices for NNPOL_TASK_LISSAJOUS_BODY (export_policy_c). */
-#define T_PERIOD 0
-#define AMPLITUDE 1
-#define CENTER_Z 2
-#define N_SAMPLES 3
-#define SAMPLES_DT 4
+/* task[] indices (nnpol_slot.h). */
+#define T_PERIOD NNPOL_TASK_T_PERIOD
+#define AMPLITUDE NNPOL_TASK_AMPLITUDE
+#define CENTER_Z NNPOL_TASK_CENTER_Z
+#define N_SAMPLES NNPOL_TASK_N_SAMPLES
+#define SAMPLES_DT NNPOL_TASK_SAMPLES_DT
+#define MOTOROBS NNPOL_TASK_MOTOROBS
 
-void nnpolRef(const nnpolSlotHeader_t* hdr, float t, float out[3])
+/* Curve layout in nnpolSnapshot_t.curve (nnpol.h). */
+#define C_AMP 0
+#define C_OMEGA 3
+#define C_PHASE 6
+#define C_CENTER 9
+#define C_YAW 12
+
+static void rotZ(float yaw, const float in[3], float out[3])
 {
+  const float c = cosf(yaw), s = sinf(yaw);
+  out[0] = c * in[0] - s * in[1];
+  out[1] = s * in[0] + c * in[1];
+  out[2] = in[2];
+}
+
+void nnpolRef(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap, float t, float out[3])
+{
+  if (hdr->taskId == NNPOL_TASK_EASY_BODY) {
+    const float* cv = snap->curve;
+    float local[3];
+    for (int i = 0; i < 3; i++) {
+      local[i] = cv[C_AMP + i] * sinf(cv[C_OMEGA + i] * t + cv[C_PHASE + i]);
+    }
+    rotZ(cv[C_YAW], local, out);
+    out[0] += cv[C_CENTER + 0];
+    out[1] += cv[C_CENTER + 1];
+    out[2] += cv[C_CENTER + 2];
+    return;
+  }
   const float w = 2.0f * (float)M_PI / hdr->task[T_PERIOD];
   out[0] = hdr->task[AMPLITUDE] * sinf(w * t);
   out[1] = 0.0f;
@@ -81,16 +123,27 @@ static void quatMul(const float a[4], const float b[4], float out[4])
   out[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
 }
 
-int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
-                  float obs[NNPOL_MAX_OBS_DIM])
+int nnpolObsDim(const nnpolSlotHeader_t* hdr)
 {
-  if (hdr->taskId != NNPOL_TASK_LISSAJOUS_BODY) {
+  if (hdr->taskId != NNPOL_TASK_LISSAJOUS_BODY && hdr->taskId != NNPOL_TASK_EASY_BODY) {
     return 0;
   }
   const int nSamples = (int)hdr->task[N_SAMPLES];
-  if (nSamples < 0 || 10 + 3 * nSamples > NNPOL_MAX_OBS_DIM) {
+  if (nSamples < 0) {
     return 0;
   }
+  const int dim = 10 + 3 * nSamples + (hdr->task[MOTOROBS] != 0.0f ? 4 : 0);
+  return dim <= NNPOL_MAX_OBS_DIM ? dim : 0;
+}
+
+int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
+                  float obs[NNPOL_MAX_OBS_DIM])
+{
+  const int dim = nnpolObsDim(hdr);
+  if (dim == 0) {
+    return 0;
+  }
+  const int nSamples = (int)hdr->task[N_SAMPLES];
   const float DEG2RAD = (float)M_PI / 180.0f;
 
   /* The attitude in the mocap frame: R_wb for the body-frame rotations
@@ -121,19 +174,23 @@ int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
   obs[n++] = snap->gyro_deg[1] * DEG2RAD;
   obs[n++] = snap->gyro_deg[2] * DEG2RAD;
 
-  const float c = cosf(snap->yaw0), s = sinf(snap->yaw0);
   for (int k = 0; k < nSamples; k++) {
-    float ref[3];
-    nnpolRef(hdr, snap->t + (float)k * hdr->task[SAMPLES_DT], ref);
+    float ref[3], yawed[3];
+    nnpolRef(hdr, snap, snap->t + (float)k * hdr->task[SAMPLES_DT], ref);
     /* R_tw ref: the nominal curve yawed to the engage heading. */
-    const float rx = c * ref[0] - s * ref[1];
-    const float ry = s * ref[0] + c * ref[1];
-    const float e_w[3] = { rx + snap->off[0] - snap->pos[0],
-                           ry + snap->off[1] - snap->pos[1],
-                           ref[2] + snap->off[2] - snap->pos[2] };
+    rotZ(snap->yaw0, ref, yawed);
+    const float e_w[3] = { yawed[0] + snap->off[0] - snap->pos[0],
+                           yawed[1] + snap->off[1] - snap->pos[1],
+                           yawed[2] + snap->off[2] - snap->pos[2] };
     float e_b[3];
     worldToBody(Rwb, e_w, e_b);
     obs[n++] = e_b[0]; obs[n++] = e_b[1]; obs[n++] = e_b[2];
+  }
+
+  if (hdr->task[MOTOROBS] != 0.0f) {
+    for (int i = 0; i < 4; i++) {
+      obs[n++] = snap->rpm[i];
+    }
   }
   return n;
 }
