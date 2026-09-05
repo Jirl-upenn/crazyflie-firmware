@@ -2,7 +2,7 @@
 
 Runs a trained actor network on the Crazyflie's STM32F405 instead of on
 the ground station, at the policy's control rate, from a policy the ground
-station uploaded over the radio into one of five flash slots. Design and
+station uploaded over the radio into one of four flash slots. Design and
 validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 
 ## What it does
@@ -17,7 +17,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
   are `policy_slot.bin` blobs written by `mjc_dronetests/export_policy_c.py`
   (a 256-byte header — identity hash, dims, activation, decode kind, action
   box or mixer anchors, thrust identification, task constants — plus the
-  fp32 weights) that live in the internal-flash sectors 7-11, one 128 KB
+  fp32 weights) that live in the internal-flash sectors 8-11, one 128 KB
   slot each, uploaded through the `MEM_TYPE_APP` memory handler and
   selected with `nnpol.slot`. The app task validates the selected slot
   (CRC) and publishes its identity in the read-only `nnpol.hash0-3` /
@@ -74,7 +74,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 
 ## Slot protocol (what the ROS driver does)
 
-1. `nnpol.slotErase = i` — the app task erases sector 7+i on the ground,
+1. `nnpol.slotErase = i` — the app task erases sector 8+i on the ground,
    disengaged and disarmed (the erase stalls the whole MCU for 1-2 s; the
    independent watchdog is widened around it). `nnpol.slotState` goes
    1 (erasing) → 2 (erased) or 3 (failed).
@@ -97,7 +97,7 @@ pixi run --manifest-path ../../pixi.toml make -j                 # build
 pixi run --manifest-path ../../pixi.toml make cload              # flash
 ```
 
-The image must end below `0x08080000` (sector 7): ~308 KB today against a
+The image must end below `0x08080000` (sector 8): ~308 KB today against a
 496 KB ceiling. Check the map before growing the firmware.
 
 ## Host parity

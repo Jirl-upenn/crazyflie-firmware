@@ -5,11 +5,13 @@
  * memory handler and selected at run time. Firmware-only (flash, IWDG,
  * mem subsystem); the format itself is in nnpol_slot_format.c.
  *
- * Geometry: STM32F405 sectors 7..11 are 128 KB each at 0x08080000..
- * 0x080FFFFF; the linker's FLASH region is 0x08004000 + 1008 KB, and the
- * app image ends well below 0x08080000 (check the map if the firmware
- * ever grows past 496 KB: the bank would then overlap the image and the
- * first erase would brick the flash until a reflash).
+ * Geometry: STM32F405 sectors 8..11 are 128 KB each at 0x08080000..
+ * 0x080FFFFF - the last four sectors of the 1 MB part (sector 7 is
+ * 0x08060000..0x0807FFFF and sector 12 does not exist). The linker's
+ * FLASH region is 0x08004000 + 1008 KB, and the app image ends well below
+ * 0x08080000 (check the map if the firmware ever grows past 496 KB: the
+ * bank would then overlap the image and the first erase would brick the
+ * flash until a reflash).
  */
 #ifndef NNPOL_SLOT_BANK_H
 #define NNPOL_SLOT_BANK_H
@@ -21,7 +23,7 @@
 
 #define NNPOL_SLOT_BASE 0x08080000u
 #define NNPOL_SLOT_BYTES 0x20000u
-#define NNPOL_NUM_SLOTS 5u
+#define NNPOL_NUM_SLOTS 4u
 #define NNPOL_SLOT_NONE 255u
 
 /** Register the MEM_TYPE_APP handler and scan the bank. */

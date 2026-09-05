@@ -105,7 +105,9 @@ bool nnpolSlotBankErase(uint8_t slot)
   if (slot >= NNPOL_NUM_SLOTS || !writesAllowed()) {
     return false;
   }
-  const uint32_t sector = FLASH_Sector_7 + (uint32_t)slot * (FLASH_Sector_8 - FLASH_Sector_7);
+  /* Slot i lives in sector 8 + i (NNPOL_SLOT_BASE is sector 8's start);
+   * the std-periph sector codes step by 8 per sector. */
+  const uint32_t sector = FLASH_Sector_8 + (uint32_t)slot * (FLASH_Sector_9 - FLASH_Sector_8);
 
   watchdogWiden(true);
   FLASH_Unlock();
