@@ -1,21 +1,21 @@
 /**
  * nnpol_action.c — clipped action -> command, along the decode path the
- * checkpoint's action_type selects (NNPOL_ACTION_KIND in the generated
- * firmware_export.h). Each path is a transcription of the deployed HOST
- * path in crazyflie-ros, so the onboard and shadow commands agree to
- * float precision:
+ * slot header's actionKind selects. Each path is a transcription of the
+ * deployed HOST path in crazyflie-ros, so the onboard and shadow commands
+ * agree to float precision:
  *
- *   MELLINGER  MellingerAttitudePolicy.decode: mid + a * half (rad, N; no
- *              yaw offset — the lissajous tasks never rotate their
- *              observation frame); angles to degrees
+ *   MELLINGER  MellingerAttitudePolicy.decode: mid + a * half (rad, N),
+ *              the yaw ANGLE anchored back into the mocap frame (+ yaw0,
+ *              wrapped to [-pi, pi) — only when yaw0 != 0, exactly as the
+ *              host's `if offset:`); angles to degrees
  *              (send_attitude_command + attitude_cmd_clbk,
  *              FIRMWARE_PITCH_SIGN = +1); collective through
  *              mellinger_thrust_to_pwm; the radio clamp.
  *   CTBR       BodyRatePolicy.decode: the same affine map on the body-rate
- *              box (rad/s, N); rates to degrees/second
- *              (send_ctbr_policy_command); the SAME thrust map and clamp
- *              — that path deliberately does not use the SE3 cascade's
- *              c1/c2/c3 fit.
+ *              box (rad/s, N), no anchor (rates are body-frame); rates to
+ *              degrees/second (send_ctbr_policy_command); the SAME thrust
+ *              map and clamp — that path deliberately does not use the
+ *              SE3 cascade's c1/c2/c3 fit.
  *   MOTOR      MotorPwmRacingPolicy.decode: the checkpoint's mixer
  *              (crazyflow_interface/_mixer.py, mirrored in
  *              controller_motor_policy.py) -> rpm x rpm_scale ->
@@ -33,6 +33,8 @@
  * host's numbers; nnpol_controller.c applies the negation where the radio
  * path would (see nnpol.h nnpolCmd_t).
  *
+ * Every constant comes from the slot header (box, mixer anchors, the
+ * drone's thrust identification), so one build serves every checkpoint.
  * Pure C: host-testable, no firmware includes.
  */
 #include <math.h>
@@ -52,84 +54,88 @@ static float clip1(float v)
   return v;
 }
 
+/* Python's (v + pi) % (2 pi) - pi: the modulo is non-negative, so the
+ * result lies in [-pi, pi). */
+static float wrapPi(float v)
+{
+  const float twoPi = 2.0f * (float)M_PI;
+  float r = fmodf(v + (float)M_PI, twoPi);
+  if (r < 0.0f) { r += twoPi; }
+  return r - (float)M_PI;
+}
+
 /* Per-motor rpm -> 16-bit ratio at the pushed nominal voltage: the host's
  * rpm_to_pwm (controller_motor_policy.py), np.rint then clip. */
-static float rpmToPwm(float rpm, float vnom)
+static float rpmToPwm(const nnpolSlotHeader_t* h, float rpm, float vnom)
 {
-  const float vMotor = (rpm - NNPOL_VMOTOR2RPM_K0) / NNPOL_VMOTOR2RPM_K1;
+  const float vMotor = (rpm - h->vmotor2rpm[0]) / h->vmotor2rpm[1];
   float pwm = rintf(65535.0f * vMotor / vnom);
   if (pwm < 0.0f) { pwm = 0.0f; }
   if (pwm > 65535.0f) { pwm = 65535.0f; }
   return pwm;
 }
 
-#if NNPOL_ACTION_KIND == NNPOL_ACTION_KIND_MOTOR
-
-#if NNPOL_MIXER != NNPOL_MIXER_RPM_DIRECT
 /* _mixer.mix_rpm_action: two hover-anchored segments, action 0 = exact hover. */
-static float mixRpmAction(float a)
+static float mixRpmAction(const nnpolSlotHeader_t* h, float a)
 {
   if (a <= 0.0f) {
-    return (a + 1.0f) * NNPOL_HOVER_RPM;
+    return (a + 1.0f) * h->hoverRpm;
   }
-  return NNPOL_HOVER_RPM + (NNPOL_MAX_RPM - NNPOL_HOVER_RPM) * a;
+  return h->hoverRpm + (h->maxRpm - h->hoverRpm) * a;
 }
-#endif
 
-static void mixer(const float a[NNPOL_ACTION_DIM], float rpm[4])
+static void mixer(const nnpolSlotHeader_t* h, const float a[NNPOL_ACTION_DIM], float rpm[4])
 {
-#if NNPOL_MIXER == NNPOL_MIXER_ATTITUDE
-  /* _mixer.mix_attitude_rpm: [thrust_norm, roll, pitch, yaw_rate] ->
-   * hover-anchored collective plus fixed-gain differentials, clipped. */
-  const float collective = mixRpmAction(a[0]);
-  const float scale = NNPOL_DIFFERENTIAL_FRAC * NNPOL_HOVER_RPM;
-  const float roll = a[1], pitch = a[2], yawRate = a[3];
-  rpm[0] = collective + roll * scale - pitch * scale - yawRate * scale;
-  rpm[1] = collective - roll * scale - pitch * scale + yawRate * scale;
-  rpm[2] = collective - roll * scale + pitch * scale - yawRate * scale;
-  rpm[3] = collective + roll * scale + pitch * scale + yawRate * scale;
-  for (int i = 0; i < 4; i++) {
-    if (rpm[i] < 0.0f) { rpm[i] = 0.0f; }
-    if (rpm[i] > NNPOL_MAX_RPM) { rpm[i] = NNPOL_MAX_RPM; }
+  switch (h->mixer) {
+    case NNPOL_MIXER_ATTITUDE: {
+      /* _mixer.mix_attitude_rpm: [thrust_norm, roll, pitch, yaw_rate] ->
+       * hover-anchored collective plus fixed-gain differentials, clipped. */
+      const float collective = mixRpmAction(h, a[0]);
+      const float scale = h->differentialFrac * h->hoverRpm;
+      const float roll = a[1], pitch = a[2], yawRate = a[3];
+      rpm[0] = collective + roll * scale - pitch * scale - yawRate * scale;
+      rpm[1] = collective - roll * scale - pitch * scale + yawRate * scale;
+      rpm[2] = collective - roll * scale + pitch * scale - yawRate * scale;
+      rpm[3] = collective + roll * scale + pitch * scale + yawRate * scale;
+      for (int i = 0; i < 4; i++) {
+        if (rpm[i] < 0.0f) { rpm[i] = 0.0f; }
+        if (rpm[i] > h->maxRpm) { rpm[i] = h->maxRpm; }
+      }
+      break;
+    }
+    case NNPOL_MIXER_RPM_DIRECT:
+      /* _mixer.rpm_direct: one line through [0, max_rpm], no hover anchor. */
+      for (int i = 0; i < 4; i++) {
+        rpm[i] = h->maxRpm * (a[i] + 1.0f) * 0.5f;
+      }
+      break;
+    default:
+      /* _mixer.mix_rpm_action per motor. */
+      for (int i = 0; i < 4; i++) {
+        rpm[i] = mixRpmAction(h, a[i]);
+      }
+      break;
   }
-#elif NNPOL_MIXER == NNPOL_MIXER_RPM_DIRECT
-  /* _mixer.rpm_direct: one line through [0, max_rpm], no hover anchor. */
-  for (int i = 0; i < 4; i++) {
-    rpm[i] = NNPOL_MAX_RPM * (a[i] + 1.0f) * 0.5f;
-  }
-#else
-  /* _mixer.mix_rpm_action per motor. */
-  for (int i = 0; i < 4; i++) {
-    rpm[i] = mixRpmAction(a[i]);
-  }
-#endif
 }
-
-#else /* setpoint kinds */
-
-static const float kActionMid[NNPOL_ACTION_DIM] = NNPOL_ACTION_MID;
-static const float kActionHalf[NNPOL_ACTION_DIM] = NNPOL_ACTION_HALF;
 
 /* Collective newtons -> legacy thrust setpoint: the host's
  * mellinger_thrust_to_pwm. F/4 -> per-motor rpm as the positive root of
  * a2*rpm^2 + a1*rpm + (a0 - F/4) = 0 (a thrust below what the curve can
  * produce has no real root, so it maps to zero rpm rather than
  * misbehaving), then rpm -> V -> pwm16, rounded as the host rounds. */
-static float collectiveToPwm(float thrustN, float vnom)
+static float collectiveToPwm(const nnpolSlotHeader_t* h, float thrustN, float vnom)
 {
-  const float a0 = NNPOL_RPM2THRUST_A0;
-  const float a1 = NNPOL_RPM2THRUST_A1;
-  const float a2 = NNPOL_RPM2THRUST_A2;
+  const float a0 = h->rpm2thrust[0];
+  const float a1 = h->rpm2thrust[1];
+  const float a2 = h->rpm2thrust[2];
   const float f = (thrustN > 0.0f ? thrustN : 0.0f) * 0.25f;
   const float disc = a1 * a1 - 4.0f * a2 * (a0 - f);
   const float rpm = disc < 0.0f ? 0.0f : (-a1 + sqrtf(disc)) / (2.0f * a2);
-  return rpmToPwm(rpm, vnom);
+  return rpmToPwm(h, rpm, vnom);
 }
 
-#endif
-
-void nnpolDecodeAction(const float action[NNPOL_ACTION_DIM], float vnom,
-                       float rpmScale, nnpolCmd_t* out)
+void nnpolDecodeAction(const nnpolSlotHeader_t* h, const float action[NNPOL_ACTION_DIM],
+                       float vnom, float rpmScale, float yaw0, nnpolCmd_t* out)
 {
   memset(out, 0, sizeof(*out));
   float a[NNPOL_ACTION_DIM];
@@ -137,26 +143,33 @@ void nnpolDecodeAction(const float action[NNPOL_ACTION_DIM], float vnom,
     a[i] = clip1(action[i]);
   }
 
-#if NNPOL_ACTION_KIND == NNPOL_ACTION_KIND_MOTOR
-  float rpm[4];
-  mixer(a, rpm);
-  for (int i = 0; i < 4; i++) {
-    out->rpm[i] = rpm[i] * rpmScale;
-    out->motorPwm[i] = rpmToPwm(out->rpm[i], vnom);
+  if (h->actionKind == NNPOL_ACTION_KIND_MOTOR) {
+    float rpm[4];
+    mixer(h, a, rpm);
+    for (int i = 0; i < 4; i++) {
+      out->rpm[i] = rpm[i] * rpmScale;
+      out->motorPwm[i] = rpmToPwm(h, out->rpm[i], vnom);
+    }
+    return;
   }
-#else
-  (void)rpmScale;
+
   const float RAD2DEG = 180.0f / (float)M_PI;
   float sp[NNPOL_ACTION_DIM];
   for (int i = 0; i < NNPOL_ACTION_DIM; i++) {
-    sp[i] = kActionMid[i] + a[i] * kActionHalf[i];
+    sp[i] = h->actionMid[i] + a[i] * h->actionHalf[i];
+  }
+  if (h->actionKind == NNPOL_ACTION_KIND_MELLINGER && yaw0 != 0.0f) {
+    /* Roll and pitch are body-frame and survive a change of world heading
+     * untouched; the yaw is an absolute heading in the observation's
+     * (anchored) frame and is rotated back into the mocap frame. */
+    sp[2] = wrapPi(sp[2] + yaw0);
   }
   /* MELLINGER: rad -> deg; CTBR: rad/s -> deg/s. Same factor, host sign. */
   out->ch[0] = sp[0] * RAD2DEG;
   out->ch[1] = sp[1] * RAD2DEG;
   out->ch[2] = sp[2] * RAD2DEG;
   out->thrustN = sp[3];
-  out->thrustPwm = collectiveToPwm(sp[3], vnom);
+  out->thrustPwm = collectiveToPwm(h, sp[3], vnom);
   if (out->thrustPwm < NNPOL_LEGACY_MIN_THRUST) {
     out->thrustSetpoint = 0.0f;
   } else if (out->thrustPwm > NNPOL_LEGACY_MAX_THRUST) {
@@ -164,5 +177,4 @@ void nnpolDecodeAction(const float action[NNPOL_ACTION_DIM], float vnom,
   } else {
     out->thrustSetpoint = out->thrustPwm;
   }
-#endif
 }
