@@ -755,8 +755,9 @@ PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, runHz, &paramRunHz)
 PARAM_ADD(PARAM_UINT8, slot, &paramSlot)
 /** @brief The slot actually selected and validated, read-only (255 = none). */
 PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, slotSel, &paramSlotSel)
-/** @brief Write a slot index to erase it (on the ground, disengaged, disarmed);
- * reads back 255 when done. Erasing the selected slot deselects it. */
+/** @brief Write a slot index to empty it (disengaged, disarmed; instant -
+ * the slot is RAM); reads back 255 when done. Erasing the selected slot
+ * deselects it. */
 PARAM_ADD(PARAM_UINT8, slotErase, &paramSlotErase)
 /** @brief 0 idle, 1 erasing, 2 erased, 3 erase failed, 4 select failed,
  * 5 selected. */
@@ -768,7 +769,8 @@ PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, slotStatus, &paramSlotStatus)
 PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, slotValid, &paramSlotValid)
 PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, nSlots, &paramNumSlots)
 /** @brief Upload progress: the slot the last radio write landed in and the
- * bytes written to it since its erase. */
+ * bytes written to it since its erase. The slot is RAM: a power cycle
+ * empties it, and the controller uploads again at its next start. */
 PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, writeSlot, &paramWriteSlot)
 PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, writtenBytes, &paramWrittenBytes)
 /** @brief Identity of the SELECTED slot (firmware_export.json hash words), read-only. */

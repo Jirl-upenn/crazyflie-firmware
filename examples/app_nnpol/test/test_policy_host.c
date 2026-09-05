@@ -33,11 +33,12 @@
 #include <string.h>
 
 #include "nnpol.h"
+#include "nnpol_slot_bank.h"
 
 #define SNAP_FLOATS 85
 #define CMD_FLOATS 14
 #define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 3)
-#define SLOT_CAPACITY 0x20000u
+#define SLOT_CAPACITY NNPOL_SLOT_BYTES   /* nnpol_slot_bank.h: the vehicle's RAM slot */
 
 static uint8_t g_slot[SLOT_CAPACITY];
 

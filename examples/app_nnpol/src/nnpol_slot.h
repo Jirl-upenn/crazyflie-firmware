@@ -1,10 +1,10 @@
 /**
  * nnpol_slot.h — the policy SLOT format: one self-describing blob per
- * checkpoint, written by mjc_dronetests/export_policy_c.py as
- * policy_slot.bin, uploaded over the radio into one of the app's flash
- * slots (nnpol_slot_bank.c) and selected by the ground station by
- * identity hash — so switching checkpoints is a config.yaml edit, not a
- * reflash. Everything the app needs is in the 256-byte header; the
+ * checkpoint, written by mjx-drone-trainer/export_policy_c.py as
+ * policy_slot.bin, uploaded over the radio into the app's RAM slot
+ * (nnpol_slot_bank.c) at every controller start and selected by the
+ * ground station by identity hash — so switching checkpoints is a
+ * config.yaml edit, not a reflash. Everything the app needs is in the 256-byte header; the
  * network's fp32 weights follow it in the output-major layout the
  * interpreter (nnpol_policy.c) walks.
  *

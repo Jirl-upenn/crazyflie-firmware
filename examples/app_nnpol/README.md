@@ -2,7 +2,7 @@
 
 Runs a trained actor network on the Crazyflie's STM32F405 instead of on
 the ground station, at the policy's control rate, from a policy the ground
-station uploaded over the radio into one of four flash slots. Design and
+station uploads over the radio into a RAM slot at every controller start. Design and
 validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 
 ## What it does
@@ -14,23 +14,24 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
   setpoint (`oot_rate`) to the stock PID — so behaviour is identical to
   `stabilizer.controller = 2` or `1`, which is validation step 1.
 - **The app is checkpoint-agnostic: build and flash it once.** Policies
-  are `policy_slot.bin` blobs written by `mjc_dronetests/export_policy_c.py`
+  are `policy_slot.bin` blobs written by `mjx-drone-trainer/export_policy_c.py`
   (a 256-byte header — identity hash, dims, activation, decode kind, action
   box or mixer anchors, thrust identification, task constants — plus the
-  fp32 weights) that live in the internal-flash sectors 8-11, one 128 KB
-  slot each, uploaded through the `MEM_TYPE_APP` memory handler and
-  selected with `nnpol.slot`. The app task validates the selected slot
-  (CRC) and publishes its identity in the read-only `nnpol.hash0-3` /
+  fp32 weights) uploaded through the `MEM_TYPE_APP` memory handler into
+  ONE 48 KB RAM slot (`nnpol_slot_bank.c`; sized for the 64x64x64 family,
+  the exporter refuses anything larger) and selected with `nnpol.slot`.
+  Nothing is ever written to flash. The app task validates the selected
+  slot (CRC) and publishes its identity in the read-only `nnpol.hash0-3` /
   `obsDim` / `actDim` / `kind` / `taskId` / `ctrlHz` params, which the
   ground station checks before engaging. crazyflie-ros does all of this
-  from `config.yaml`: a drone's run directory is found in a slot or
-  uploaded into a free one, then selected — no reflash.
+  from `config.yaml` at every controller start: upload (a few seconds, on
+  the ground; skipped when the vehicle already reports the run's hash),
+  select, verify. A power cycle empties the slot; the next start refills it.
 - On every policy tick (`nnpol.ctrlHz`, a writable param defaulting to the
   slot's trained `ctrl_freq`; the host pushes `policy.inference_hz` before
   engaging) the controller snapshots the EKF state + gyro and notifies the
   app task, which builds the observation, runs the network through the
-  interpreter (`nnpol_policy.c`, weights read straight from the flash
-  slot — no RAM), decodes the action along the slot's kind (attitude,
+  interpreter (`nnpol_policy.c`, weights read from the RAM slot), decodes the action along the slot's kind (attitude,
   body rates, or per-motor PWM) and publishes it into a sequence-locked
   buffer. The controller applies the newest complete action as a
   zero-order hold, synthesizing the `setpoint_t` the same command would
@@ -64,7 +65,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 | file | role |
 |---|---|
 | `src/nnpol_controller.c` | firmware glue: OOT controller, app task, slot select/erase housekeeping, params, logs |
-| `src/nnpol_slot_bank.c` | the flash slot bank: MEM_TYPE_APP upload handler, sector erase (watchdog widened), validity scan |
+| `src/nnpol_slot_bank.c` | the RAM slot: MEM_TYPE_APP upload handler, erase (memset), validity scan |
 | `src/nnpol_slot.h` / `nnpol_slot_format.c` | the blob format and its validation (pure C, host-testable) |
 | `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh (pure C) |
 | `src/nnpol_obs_lissajous.c` | the Lissajous-family body observations: the fixed eight or a pushed per-run curve (traj_easy), with the yaw anchor and the optional rotor-speed tail (pure C) |
@@ -74,16 +75,13 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 
 ## Slot protocol (what the ROS driver does)
 
-1. `nnpol.slotErase = i` — the app task erases sector 8+i on the ground,
-   disengaged and disarmed (the erase stalls the whole MCU for 1-2 s; the
-   independent watchdog is widened around it). `nnpol.slotState` goes
-   1 (erasing) → 2 (erased) or 3 (failed).
+1. `nnpol.slotErase = i` — the app task empties the slot (instant; refused
+   while a policy is engaged or the vehicle armed). `nnpol.slotState` goes
+   2 (erased) or 3 (failed).
 2. Stream `policy_slot.bin` with cflib's memory write (`MEM_TYPE_APP`,
-   offset `i * 131072`): sequential acknowledged 24-byte chunks, each
-   whole words, programmed as they arrive. A word is programmed only if
-   it reads erased or already holds the same data (retransmits), so a
-   stale slot can never be half-overwritten. `nnpol.writeSlot` /
-   `writtenBytes` show progress.
+   offset `i * 49152`): sequential acknowledged 24-byte chunks, copied in
+   as they arrive (a retransmit rewrites the same bytes). `nnpol.writeSlot`
+   / `writtenBytes` show progress.
 3. `nnpol.slot = i` — the app task validates (CRC over the whole blob) and
    publishes the identity; `slotSel` confirms, `slotStatus` says why not.
    `nnpol.slotValid` is the bitmask of slots holding a valid blob.
@@ -97,8 +95,9 @@ pixi run --manifest-path ../../pixi.toml make -j                 # build
 pixi run --manifest-path ../../pixi.toml make cload              # flash
 ```
 
-The image must end below `0x08080000` (sector 8): ~308 KB today against a
-496 KB ceiling. Check the map before growing the firmware.
+The slot is a 48 KB `.bss` buffer: check the RAM figure the build prints
+(`NNPOL_SLOT_BYTES` in `nnpol_slot_bank.h` is the knob if it ever has to
+shrink; the exporter's `SLOT_CAPACITY_BYTES` must match).
 
 ## Host parity
 

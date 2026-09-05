@@ -1,17 +1,15 @@
 /**
- * nnpol_slot_bank.h — the flash slot bank: NNPOL_NUM_SLOTS policy blobs
- * (nnpol_slot.h) resident in the internal-flash sectors the firmware
- * image never reaches, uploaded over the radio through a MEM_TYPE_APP
- * memory handler and selected at run time. Firmware-only (flash, IWDG,
- * mem subsystem); the format itself is in nnpol_slot_format.c.
+ * nnpol_slot_bank.h — the policy slot: ONE policy blob (nnpol_slot.h)
+ * resident in RAM, uploaded over the radio through a MEM_TYPE_APP memory
+ * handler at every controller start and selected at run time. Nothing
+ * here touches flash: the app image is flashed once and never rewritten,
+ * a checkpoint change is a config.yaml edit, and a power cycle simply
+ * empties the slot until the next upload (a few seconds, on the ground).
  *
- * Geometry: STM32F405 sectors 8..11 are 128 KB each at 0x08080000..
- * 0x080FFFFF - the last four sectors of the 1 MB part (sector 7 is
- * 0x08060000..0x0807FFFF and sector 12 does not exist). The linker's
- * FLASH region is 0x08004000 + 1008 KB, and the app image ends well below
- * 0x08080000 (check the map if the firmware ever grows past 496 KB: the
- * bank would then overlap the image and the first erase would brick the
- * flash until a reflash).
+ * The slot is sized for the 64x64x64 family (fp32 weights, 41-46 KB with
+ * the observations flown here); the exporter refuses a blob that would
+ * not fit, and so does the validator. Firmware-only (mem subsystem,
+ * supervisor); the format itself is in nnpol_slot_format.c.
  */
 #ifndef NNPOL_SLOT_BANK_H
 #define NNPOL_SLOT_BANK_H
@@ -21,15 +19,19 @@
 
 #include "nnpol_slot.h"
 
-#define NNPOL_SLOT_BASE 0x08080000u
-#define NNPOL_SLOT_BYTES 0x20000u
-#define NNPOL_NUM_SLOTS 4u
+/** Bytes one slot holds: 48 KB, plain .bss in the F405's 128 KB SRAM.
+ * A 64x64x64 checkpoint needs 256 + 4 * (obs*64 + 64 + 2*(64*64 + 64) +
+ * 64*4 + 4) bytes: 41.2 KB at obs 25, 45.1 KB at obs 40, 46.1 KB at
+ * obs 44; an observation wider than 55 no longer fits and the exporter
+ * refuses it. Raise it only against the build's RAM report. */
+#define NNPOL_SLOT_BYTES 0xC000u
+#define NNPOL_NUM_SLOTS 1u
 #define NNPOL_SLOT_NONE 255u
 
-/** Register the MEM_TYPE_APP handler and scan the bank. */
+/** Register the MEM_TYPE_APP handler and empty the slot. */
 void nnpolSlotBankInit(void);
 
-/** The slot's header (raw flash; validate before trusting). */
+/** The slot's header (raw buffer; validate before trusting). */
 const nnpolSlotHeader_t* nnpolSlotBankHeader(uint8_t slot);
 
 /** Bit i set = slot i validates (nnpolSlotValidate == OK). Cached; refreshed
@@ -38,20 +40,15 @@ uint8_t nnpolSlotBankValidMask(void);
 uint8_t nnpolSlotBankRescan(void);
 nnpolSlotStatus_t nnpolSlotBankStatus(uint8_t slot);
 
-/** Erase one slot's sector. TASK CONTEXT ONLY, ON THE GROUND: the erase
- * stalls every instruction fetch from flash for ~1-2 s, so nothing —
- * stabilizer, radio, FreeRTOS tick — runs meanwhile; the independent
- * watchdog is widened around it and restored after. Refuses (false) while
- * the bank is locked (policy engaged) or the vehicle is armed. */
+/** Empty one slot (fill with 0xFF, the "erased" the validator recognises).
+ * Instant; refused while the bank is locked or the vehicle armed. */
 bool nnpolSlotBankErase(uint8_t slot);
 
-/** While locked, radio writes and erases are refused: set by the
- * controller for as long as a policy is engaged or the vehicle armed. */
+/** Locked = an engaged policy is reading the slot: uploads and erases are
+ * refused until it is released. */
 void nnpolSlotBankSetLocked(bool locked);
 
-/** Upload bookkeeping, for the ground station (params): the slot the last
- * radio write landed in and how many bytes of it have been written since
- * its erase (255 / 0 when nothing is in progress). */
+/** Upload progress, for the nnpol.writeSlot / writtenBytes params. */
 uint8_t nnpolSlotBankWriteSlot(void);
 uint32_t nnpolSlotBankWrittenBytes(void);
 
