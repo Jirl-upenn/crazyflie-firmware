@@ -2,6 +2,11 @@
  * nnpol_policy.c — the network interpreter: a dense MLP forward pass over
  * a slot's weights, dims and activation read from its header at run time.
  *
+ * The last layer's output map comes from the header too: a PPO head is
+ * the raw mean (the caller clips), a SAC / BPTT / TD3 head is tanh'd here,
+ * with the same fast_tanhf the hidden layers use — its error sits below
+ * float32 resolution, so the numpy reference (np.tanh) agrees to ~1e-7.
+ *
  * Kernel and layout are the exporter's const-fp32 ones (export_policy_c
  * _emit_forward output_major=True / _const_payload), transcribed from the
  * generated policy.c into loops over the header's layerDims: each kernel
@@ -64,6 +69,7 @@ void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTI
   const nnpolSlotHeader_t* h = p->hdr;
   const uint16_t numLayers = h->numLayers;
   const uint16_t activation = h->activation;
+  const int squash = (h->outputSquash == NNPOL_SQUASH_TANH);
   float bufA[NNPOL_MAX_HIDDEN], bufB[NNPOL_MAX_HIDDEN];
   const float* in = obs;
   const float* w = p->weights;
@@ -88,9 +94,12 @@ void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTI
         const float x = in[k];
         a0 += x * w0[k]; a1 += x * w1[k]; a2 += x * w2[k]; a3 += x * w3[k];
       }
-      if (isLast) {
-        /* Final layer: raw linear output, no activation (models.Actor's
-         * mean is never activation-squashed); the caller clips. */
+      if (isLast && squash) {
+        out[j + 0] = fast_tanhf(a0); out[j + 1] = fast_tanhf(a1);
+        out[j + 2] = fast_tanhf(a2); out[j + 3] = fast_tanhf(a3);
+      } else if (isLast) {
+        /* Final layer of a clip head: the raw mean (models.Actor's mean is
+         * never activation-squashed); the caller clips. */
         out[j + 0] = a0; out[j + 1] = a1; out[j + 2] = a2; out[j + 3] = a3;
       } else {
         out[j + 0] = activate(activation, a0);
@@ -105,7 +114,7 @@ void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTI
       for (int k = 0; k < inDim; k++) {
         acc += in[k] * wj[k];
       }
-      out[j] = isLast ? acc : activate(activation, acc);
+      out[j] = isLast ? (squash ? fast_tanhf(acc) : acc) : activate(activation, acc);
     }
     in = out;
   }

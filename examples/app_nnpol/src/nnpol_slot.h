@@ -36,6 +36,12 @@
 /* Activations (export_policy_c.ACTIVATION_ID). */
 #define NNPOL_ACT_TANH 0
 #define NNPOL_ACT_RELU 1
+/* Output map of the last layer (export_policy_c.SQUASH_ID): how the actor's
+ * output becomes the action. PPO's raw mean is clipped by the caller; SAC /
+ * BPTT (tanh of the mean, training/eval.py) and TD3 (the actor's own tanh)
+ * squash inside the forward pass. */
+#define NNPOL_SQUASH_NONE 0
+#define NNPOL_SQUASH_TANH 1
 /* Observation builders (export_policy_c.TASK_ID), all in nnpol_obs_lissajous.c. */
 #define NNPOL_TASK_LISSAJOUS_BODY 0    /* traj_lissajous / body[_motorobs]: the fixed eight */
 #define NNPOL_TASK_EASY_BODY 1         /* traj_easy / body[_motorobs]: a per-run curve
@@ -75,7 +81,7 @@ typedef struct {
   uint16_t numLayers;        /*  36 dense layers incl. the output layer */
   uint16_t activation;       /*  38 NNPOL_ACT_* (hidden layers only) */
   uint16_t layerDims[5];     /*  40 [obs, h1, .., out]; unused trailing = 0 */
-  uint16_t pad0;             /*  50 */
+  uint16_t outputSquash;     /*  50 NNPOL_SQUASH_* applied to the last layer */
   uint16_t actionKind;       /*  52 NNPOL_ACTION_KIND_* */
   uint16_t mixer;            /*  54 NNPOL_MIXER_* (MOTOR kind) */
   uint16_t ctrlFreqHz;       /*  56 trained control rate; nnpol.ctrlHz default */

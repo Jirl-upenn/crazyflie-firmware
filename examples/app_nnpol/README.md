@@ -66,7 +66,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 | `src/nnpol_controller.c` | firmware glue: OOT controller, app task, slot select/erase housekeeping, params, logs |
 | `src/nnpol_slot_bank.c` | the flash slot bank: MEM_TYPE_APP upload handler, sector erase (watchdog widened), validity scan |
 | `src/nnpol_slot.h` / `nnpol_slot_format.c` | the blob format and its validation (pure C, host-testable) |
-| `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh (pure C) |
+| `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh, output map from the header (clip for PPO, tanh for SAC / BPTT / TD3) (pure C) |
 | `src/nnpol_obs_lissajous.c` | the Lissajous-family body observations: the fixed eight or a pushed per-run curve (traj_easy), with the yaw anchor and the optional rotor-speed tail (pure C) |
 | `src/nnpol_obs_race.c` | the race v3 observation on the pushed pinned track, and the gate-crossing test (pure C) |
 | `src/nnpol_action.c` | action decode for all three kinds from the header's constants (pure C) |

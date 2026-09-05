@@ -52,6 +52,7 @@ nnpolSlotStatus_t nnpolSlotValidate(const void* base, uint32_t capacityBytes)
   if (h->actionDim != NNPOL_ACTION_DIM || h->obsDim == 0 || h->obsDim > NNPOL_MAX_OBS_DIM
       || h->numLayers == 0 || h->numLayers > NNPOL_MAX_LAYERS
       || (h->activation != NNPOL_ACT_TANH && h->activation != NNPOL_ACT_RELU)
+      || h->outputSquash > NNPOL_SQUASH_TANH
       || h->actionKind > NNPOL_ACTION_KIND_MOTOR || h->mixer > NNPOL_MIXER_RPM_DIRECT) {
     return NNPOL_SLOT_BAD_DIMS;
   }

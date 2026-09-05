@@ -73,7 +73,7 @@ def parse_header(blob):
     hash_words = list(v[i:i + 4]); i += 4
     obs_dim, action_dim, num_layers, activation = v[i:i + 4]; i += 4
     layer_dims = list(v[i:i + 5]); i += 5
-    i += 1  # pad
+    output_squash = v[i]; i += 1
     kind, mixer, ctrl_hz, task_id = v[i:i + 4]; i += 4
     mid = np.array(v[i:i + 4]); i += 4
     half = np.array(v[i:i + 4]); i += 4
@@ -87,7 +87,7 @@ def parse_header(blob):
         "magic": magic, "header_bytes": header_bytes, "total_bytes": total_bytes, "crc": crc,
         "hash_words": hash_words, "name": name, "payload_floats": payload_floats,
         "NNPOL_OBS_DIM": obs_dim, "NNPOL_ACTION_DIM": action_dim,
-        "num_layers": num_layers, "activation": activation,
+        "num_layers": num_layers, "activation": activation, "output_squash": output_squash,
         "layer_dims": layer_dims[:num_layers + 1],
         "NNPOL_ACTION_KIND": kind, "NNPOL_MIXER": mixer,
         "NNPOL_CTRL_FREQ_HZ": ctrl_hz, "task_id": task_id,
@@ -267,14 +267,14 @@ def np_decode(action, vnom, rpm_scale, yaw0, C):
     return out
 
 
-def np_forward(layers, activation, obs):
+def np_forward(layers, activation, obs, output_squash=0):
     act = {0: np.tanh, 1: lambda x: np.maximum(x, 0.0)}[activation]
     x = obs.astype(np.float32)
     for i, (W, b) in enumerate(layers):
         x = x @ W + b
         if i < len(layers) - 1:
             x = act(x)
-    return x
+    return np.tanh(x) if output_squash else x
 
 
 def random_snapshots(rng, n, C):
@@ -371,7 +371,8 @@ def main():
     status = int(info.stdout.split()[0])
     print(f"[{'ok' if status == 0 else 'FAIL'}] slot validation: status {status} "
           f"({info.stdout.strip()}) — {C['name']!r}, kind {C['NNPOL_ACTION_KIND']}, "
-          f"task {C['task_id']}, {C['NNPOL_OBS_DIM']}-dim obs, layers {C['layer_dims']}")
+          f"task {C['task_id']}, {C['NNPOL_OBS_DIM']}-dim obs, layers {C['layer_dims']}, "
+          f"output {'tanh' if C['output_squash'] else 'clip'}")
     if status != 0:
         failures.append("slot validation")
     with open(args.run_dir / "firmware_export.json") as f:
@@ -459,7 +460,8 @@ def main():
         tail = np.tile([VNOM, RPM_SCALE], (len(snaps), 1))
         full_c = run(exe, blob_path, "full", np.concatenate([snaps, tail], axis=1), CMD_FLOATS)
         full_np = np.stack([
-            np_decode(np.clip(np_forward(layers, C["activation"], obs_np[i].astype(np.float32)), -1, 1),
+            np_decode(np.clip(np_forward(layers, C["activation"], obs_np[i].astype(np.float32),
+                                         C["output_squash"]), -1, 1),
                       VNOM, RPM_SCALE, float(snaps[i, 17]), C)
             for i in range(len(snaps))])
         diff = full_c[:, col_f] - full_np[:, col_f]
