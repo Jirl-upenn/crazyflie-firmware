@@ -41,10 +41,17 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 - The host keeps streaming its command topic as the commander-watchdog
   keepalive and shadow reference; clearing `nnpol.enable` mid-flight is an
   instantaneous, format-compatible takeover by that stream.
+- Observations: `traj_lissajous` (the fixed eight, constants in the slot
+  header) and `traj_easy` (the run's curve pushed at engage as `nnpol.c*`),
+  each with `body` or `body_motorobs` — the latter appends the four
+  rotor speeds the app reads from its own bidirectional-DSHOT telemetry
+  (`motorsGetRPM`), held through dropouts from a hover start and
+  normalized by 15896.3 exactly as the host's `set_motor_rpm` does.
 - If the app task stops delivering actions, `nnpol.stale` counts and after
   5 policy periods the controller falls back to the radio setpoint. A slot
-  whose task has no observation builder onboard (`taskId` 0xFFFF) never
-  produces an action: `nnpol.obsErr` counts and the fallback holds.
+  whose task has no observation builder onboard (`taskId` 0xFFFF, the
+  world-frame `default` observation) never produces an action:
+  `nnpol.obsErr` counts and the fallback holds.
 - The rate becomes a stabilizer tick divider (`1000 / ctrlHz`, integer) at
   the `enable` rising edge, so only divisors of 1000 (100, 125, 200, 250,
   500 ...) run exactly; read-only `nnpol.runHz` reports what engaged.
@@ -57,7 +64,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 | `src/nnpol_slot_bank.c` | the flash slot bank: MEM_TYPE_APP upload handler, sector erase (watchdog widened), validity scan |
 | `src/nnpol_slot.h` / `nnpol_slot_format.c` | the blob format and its validation (pure C, host-testable) |
 | `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh (pure C) |
-| `src/nnpol_obs_lissajous.c` | the `traj_lissajous/body` observation with the yaw anchor (pure C) |
+| `src/nnpol_obs_lissajous.c` | the Lissajous-family body observations: the fixed eight or a pushed per-run curve (traj_easy), with the yaw anchor and the optional rotor-speed tail (pure C) |
 | `src/nnpol_action.c` | action decode for all three kinds from the header's constants (pure C) |
 | `test/` | host parity harness (plain gcc) + python runner, driven by a run directory's `policy_slot.bin` |
 
@@ -105,7 +112,8 @@ path. `--bag-npz` adds mocap-derived snapshots from a flight bag.
 
 Params (`nnpol.`): `enable` (u8, the engage switch), `startPhase` (s),
 `offX/offY/offZ` (m, the host's curve pin), `yaw0` (rad, the run's yaw
-anchor), `vnom` (V, thrust-map battery voltage), `rpmScale` (MOTOR kind's
+anchor), `cAmp0-2/cOmg0-2/cPh0-2/cCen0-2/cYaw` (a traj_easy run's curve),
+`vnom` (V, thrust-map battery voltage), `rpmScale` (MOTOR kind's
 rpm multiplier), `ctrlHz` (policy rate, default = the slot's `ctrl_freq`)
 — all latched at the `enable` rising edge; `slot` (select), `slotErase`;
 read-only: `slotSel`, `slotState`, `slotStatus`, `slotValid`, `nSlots`,
@@ -127,7 +135,7 @@ legacy thrust), `pwm0-3` (MOTOR kind's per-motor PWM), `vbx/y/z`,
 2. take off, hover at the curve's engage point, keep streaming the
    checkpoint's command topic (shadow);
 3. push `startPhase`, `offX/Y/Z`, `yaw0` (from the host's pin and
-   anchor), `vnom`, `rpmScale`, `ctrlHz`;
+   anchor), the curve (`c*`, traj_easy only), `vnom`, `rpmScale`, `ctrlHz`;
 4. set `enable = 1`, confirm by readback → onboard flight;
 5. abort/land: clear `enable` first — the host stream takes over on the
    next controller tick.

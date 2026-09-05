@@ -81,6 +81,7 @@
 #include "controller_mellinger.h"
 #include "controller_pid.h"
 #include "log.h"
+#include "motors.h"
 #include "param.h"
 #include "stabilizer_types.h"
 #include "supervisor.h"
@@ -120,6 +121,15 @@ static float paramRpmScale = 1.0f;  /* MOTOR kind: the host's motor_pwm.rpm_scal
  * read by the app task. */
 static float activeRpmScale = 1.0f;
 static float activeYaw0 = 0.0f;
+/* EASY_BODY: this run's curve, pushed by the host before enable (the
+ * nominal member of the family; the pin offset and yaw anchor are pushed
+ * separately, as for the fixed eight) and latched at the rising edge. */
+static float paramCurve[NNPOL_CURVE_FLOATS] = { 0 };
+static float activeCurve[NNPOL_CURVE_FLOATS] = { 0 };
+/* motorobs: the last valid reading per motor, normalized. Starts at hover
+ * (1.0) — a state a flying drone is in, unlike zero — and holds through
+ * DSHOT telemetry dropouts, exactly as the host's set_motor_rpm does. */
+static float heldRpm[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
 /* Policy rate. Writable (the host's policy.inference_hz), defaulting to the
  * selected slot's trained rate; latched into a tick divider at the enable
@@ -205,6 +215,13 @@ static void selectSlot(uint8_t slot)
   }
   activePolicy.hdr = h;
   activePolicy.weights = nnpolSlotWeights(h);
+  if (nnpolObsDim(h) != (int)h->obsDim) {
+    /* Selectable but not flyable: the identity is published so the ground
+     * station can say which run it is, and every policy tick then counts
+     * an obsErr instead of producing an action. */
+    DEBUG_PRINT("slot %d: no observation builder for task %d / %d-dim\n",
+                slot, h->taskId, h->obsDim);
+  }
   publishIdentity(h);
   activeKind = h->actionKind;
   activeValid = true;
@@ -464,6 +481,7 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
     activeOff[2] = paramOffZ;
     activeYaw0 = paramYaw0;
     activeRpmScale = paramRpmScale;
+    memcpy(activeCurve, paramCurve, sizeof(activeCurve));
     activeDivider = tickDividerFor(paramCtrlHz);
     paramRunHz = (uint16_t)(RATE_MAIN_LOOP / activeDivider);
     nnpolCmd_t unused;
@@ -499,6 +517,17 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
     snap.gyro_deg[1] = sensors->gyro.y;
     snap.gyro_deg[2] = sensors->gyro.z;
     snap.yaw0 = activeYaw0;
+    memcpy(snap.curve, activeCurve, sizeof(snap.curve));
+    /* Bidirectional-DSHOT rotor speed (motors.c): UINT16_MAX = invalid or
+     * no reply, held per motor. Read on every policy tick regardless of the
+     * slot's observation so the hold is warm when a motorobs slot engages. */
+    for (int i = 0; i < 4; i++) {
+      const uint16_t raw = motorsGetRPM(i);
+      if (raw != UINT16_MAX) {
+        heldRpm[i] = (float)raw / NNPOL_NOMINAL_HOVER_RPM;
+      }
+      snap.rpm[i] = heldRpm[i];
+    }
     snapshotWrite(&snap);
 
     if (appTaskHandle != NULL) {
@@ -611,6 +640,23 @@ PARAM_ADD(PARAM_FLOAT, offZ, &paramOffZ)
  * to and the observed attitude is relative to; added back to a commanded
  * yaw angle. Pushed by the host (world_yaw_offset). */
 PARAM_ADD(PARAM_FLOAT, yaw0, &paramYaw0)
+/** @brief traj_easy: this run's curve, the nominal member of the Lissajous
+ * family the host drew (controller_trajectory.Curve): amplitudes (m),
+ * angular rates (rad/s), phases (rad), centre (m), yaw (rad). Latched at
+ * the enable rising edge; ignored by the fixed-eight slots. */
+PARAM_ADD(PARAM_FLOAT, cAmp0, &paramCurve[0])
+PARAM_ADD(PARAM_FLOAT, cAmp1, &paramCurve[1])
+PARAM_ADD(PARAM_FLOAT, cAmp2, &paramCurve[2])
+PARAM_ADD(PARAM_FLOAT, cOmg0, &paramCurve[3])
+PARAM_ADD(PARAM_FLOAT, cOmg1, &paramCurve[4])
+PARAM_ADD(PARAM_FLOAT, cOmg2, &paramCurve[5])
+PARAM_ADD(PARAM_FLOAT, cPh0, &paramCurve[6])
+PARAM_ADD(PARAM_FLOAT, cPh1, &paramCurve[7])
+PARAM_ADD(PARAM_FLOAT, cPh2, &paramCurve[8])
+PARAM_ADD(PARAM_FLOAT, cCen0, &paramCurve[9])
+PARAM_ADD(PARAM_FLOAT, cCen1, &paramCurve[10])
+PARAM_ADD(PARAM_FLOAT, cCen2, &paramCurve[11])
+PARAM_ADD(PARAM_FLOAT, cYaw, &paramCurve[12])
 /** @brief Battery voltage every thrust/rpm-to-PWM map assumes (host parity). */
 PARAM_ADD(PARAM_FLOAT, vnom, &paramVnom)
 /** @brief MOTOR kind: rpm multiplier before the PWM map (host motor_pwm.rpm_scale). */

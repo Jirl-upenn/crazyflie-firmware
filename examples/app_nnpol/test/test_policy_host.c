@@ -15,11 +15,12 @@
  * Modes; all records are little-endian float32 streams:
  *   info   : prints "status obsDim actionDim numLayers kind mixer taskId ctrlHz"
  *   policy : obs[obsDim]                          -> act[4]   (raw, unclipped)
- *   obs    : snapshot[18]                         -> obs[obsDim]
+ *   obs    : snapshot[35]                         -> obs[obsDim]
  *   act    : action[4], vnom, rpmScale, yaw0      -> cmd[14]
- *   full   : snapshot[18], vnom, rpmScale         -> cmd[14]  (obs -> net -> clip -> decode)
+ *   full   : snapshot[35], vnom, rpmScale         -> cmd[14]  (obs -> net -> clip -> decode)
  *
- * snapshot[18] = [t, off(3), pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), yaw0]
+ * snapshot[35] = [t, off(3), pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), yaw0,
+ *                 curve(13: amp3 omega3 phase3 center3 yaw), rpm_norm(4)]
  * cmd[14]      = [ch0, ch1, ch2, thrustN, thrustPwm, thrustSetpoint,
  *                 rpm(4), motorPwm(4)]   — nnpolCmd_t flattened; which
  *                 columns are non-zero depends on the slot's actionKind
@@ -30,7 +31,7 @@
 
 #include "nnpol.h"
 
-#define SNAP_FLOATS 18
+#define SNAP_FLOATS 35
 #define CMD_FLOATS 14
 #define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 3)
 #define SLOT_CAPACITY 0x20000u
@@ -46,6 +47,8 @@ static void unpackSnapshot(const float* in, nnpolSnapshot_t* s)
   memcpy(s->vel_w, in + 11, 3 * sizeof(float));
   memcpy(s->gyro_deg, in + 14, 3 * sizeof(float));
   s->yaw0 = in[17];
+  memcpy(s->curve, in + 18, NNPOL_CURVE_FLOATS * sizeof(float));
+  memcpy(s->rpm, in + 31, 4 * sizeof(float));
 }
 
 static void packCmd(const nnpolCmd_t* c, float* out)

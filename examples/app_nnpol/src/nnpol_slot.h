@@ -36,9 +36,23 @@
 /* Activations (export_policy_c.ACTIVATION_ID). */
 #define NNPOL_ACT_TANH 0
 #define NNPOL_ACT_RELU 1
-/* Observation builders (export_policy_c.TASK_ID). */
-#define NNPOL_TASK_LISSAJOUS_BODY 0    /* traj_lissajous / body: nnpol_obs_lissajous.c */
+/* Observation builders (export_policy_c.TASK_ID), all in nnpol_obs_lissajous.c. */
+#define NNPOL_TASK_LISSAJOUS_BODY 0    /* traj_lissajous / body[_motorobs]: the fixed eight */
+#define NNPOL_TASK_EASY_BODY 1         /* traj_easy / body[_motorobs]: a per-run curve
+                                          pushed at engage (nnpol.c*) */
 #define NNPOL_TASK_UNSUPPORTED 0xFFFF  /* exported, uploadable, but cannot engage */
+/* task[] indices shared by both builders (export_policy_c.slot_task). */
+#define NNPOL_TASK_T_PERIOD 0          /* LISSAJOUS: fundamental period, s */
+#define NNPOL_TASK_AMPLITUDE 1         /* LISSAJOUS: x amplitude, m (z is half) */
+#define NNPOL_TASK_CENTER_Z 2          /* LISSAJOUS: centre height, m */
+#define NNPOL_TASK_N_SAMPLES 3         /* lookahead samples (as a float) */
+#define NNPOL_TASK_SAMPLES_DT 4        /* lookahead spacing, s */
+#define NNPOL_TASK_START_PHASE 5       /* LISSAJOUS: default engage phase, s */
+#define NNPOL_TASK_MOTOROBS 6          /* != 0: append 4 normalized rotor speeds */
+/* Rotor-speed normalizer of the motorobs observations: the trainer's
+ * NOMINAL_HOVER_RPM (every tasks package: 15896.3; crazyflie-ros TaskObs). */
+#define NNPOL_NOMINAL_HOVER_RPM 15896.296489245326f
+#define NNPOL_CURVE_FLOATS 13          /* EASY: amp(3) omega(3) phase(3) center(3) yaw */
 
 /* Interpreter limits: a header outside these fails validation. */
 #define NNPOL_MAX_OBS_DIM 64
@@ -69,10 +83,10 @@ typedef struct {
   float differentialFrac;    /* 100 */
   float rpm2thrust[3];       /* 104 crazyflow drone identification (a0, a1, a2) */
   float vmotor2rpm[2];       /* 116 (k0, k1) */
-  float task[8];             /* 124 task constants, meaning by taskId:
-                                    LISSAJOUS_BODY: [T_period_s, amplitude_m,
-                                    center_z_m, n_samples, samples_dt_s,
-                                    default_start_phase_s, 0, 0] */
+  float task[8];             /* 124 task constants, NNPOL_TASK_* indices:
+                                    [T_period_s, amplitude_m, center_z_m,
+                                    n_samples, samples_dt_s,
+                                    default_start_phase_s, motorobs, 0] */
   char name[64];             /* 156 run directory name, NUL-padded */
   uint32_t payloadFloats;    /* 220 weights after the header */
   uint8_t reserved[32];      /* 224 zeros */
