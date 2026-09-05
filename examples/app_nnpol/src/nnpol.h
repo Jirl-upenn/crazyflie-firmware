@@ -1,30 +1,44 @@
 /**
- * nnpol.h — shared declarations for the onboard-policy app (app_nnpol).
+ * nnpol.h — the pure-C contract of the onboard-policy app: the state
+ * snapshot the observation is built from, the decoded command, and the
+ * decode path a checkpoint's action_type selects.
  *
- * The observation and action modules declared here are PURE C: math.h plus
- * the generated firmware_export.h/policy.h only, no firmware includes — so
- * test/test_policy_host.c compiles them with plain host gcc and checks
- * them bit-for-bit against the trainer's numpy reference
- * (policy_reference.npz) before anything flies. All the firmware glue
- * (params, logging, task scheduling, setpoint synthesis) lives in
- * nnpol_controller.c, which is the only file that cannot build on the host.
+ * Everything declared here is host-buildable (test/run_host_parity.py
+ * compiles the observation and action modules with plain gcc against the
+ * SAME generated policy.c the firmware links), which is what makes the
+ * flight code itself, not a transcription of it, the thing that is checked.
  *
- * Conventions, fixed by the trainer and the deployed ROS stack (see
- * mjc_dronetests/docs/onboard_inference_plan.md section 2):
- *   - quaternion is scalar-first [w, x, y, z], sign-normalized to w >= 0
- *     (the EKF stores x, y, z, w — the CALLER reorders; nnpolBuildObs only
- *     fixes the sign).
+ * Conventions shared with the trainer (mjc_dronetests crazyflow_interface)
+ * and the ground station (crazyflie-ros):
+ *   - quaternion scalar-first (w, x, y, z), sign-normalized to w >= 0;
  *   - velocities are metres/second; the snapshot's is WORLD frame and the
- *     observation's is body frame (v_B = R^T v_W).
- *   - gyro is body-frame degrees/second (the firmware's own unit); the
- *     observation wants radians/second.
- *   - angles in the decoded setpoint are DEGREES (the legacy RPYT packet's
- *     unit); the action box is radians.
+ *     observation rotates it into the body frame;
+ *   - body rates arrive in degrees/second (the firmware's gyro) and the
+ *     observation converts them to rad/s;
+ *   - the action is [-1, 1]^4, clipped exactly as the sim clips it.
  */
 #ifndef NNPOL_H
 #define NNPOL_H
 
 #include "firmware_export.h"
+
+/* Decode paths, numbered as export_policy_c.ACTION_KIND_* (the generated
+ * firmware_export.h carries the checkpoint's as NNPOL_ACTION_KIND). */
+#define NNPOL_ACTION_KIND_MELLINGER 0  /* attitude box -> firmware Mellinger */
+#define NNPOL_ACTION_KIND_CTBR 1       /* body-rate box -> firmware rate PID */
+#define NNPOL_ACTION_KIND_MOTOR 2      /* mixer -> per-motor PWM, no onboard loop */
+
+/* Mixers for the MOTOR kind, numbered as export_policy_c.MIXER_FOR_TYPE. */
+#define NNPOL_MIXER_ATTITUDE 0     /* action_type "attitude" */
+#define NNPOL_MIXER_RPM 1          /* action_type "rpm" */
+#define NNPOL_MIXER_RPM_DIRECT 2   /* action_type "rpm_direct" */
+
+#ifndef NNPOL_ACTION_KIND
+#error "firmware_export.h carries no NNPOL_ACTION_KIND - regenerate it with export_policy_c.py"
+#endif
+#if NNPOL_ACTION_KIND == NNPOL_ACTION_KIND_MOTOR && !defined(NNPOL_MIXER)
+#error "a MOTOR-kind export needs NNPOL_MIXER - regenerate with export_policy_c.py"
+#endif
 
 /** Everything the observation is a function of, snapshotted on one
  * stabilizer tick so the app task computes from a consistent state. */
@@ -37,19 +51,30 @@ typedef struct {
   float gyro_deg[3];   /**< body rates, deg/s */
 } nnpolSnapshot_t;
 
-/** One decoded attitude command, every stage kept for logging. */
+/** One decoded command, every stage kept for logging and host parity.
+ * Which fields mean anything depends on NNPOL_ACTION_KIND; the rest are 0.
+ *
+ * ch[3] are the three non-thrust channels in the HOST's wire units and
+ * sign — exactly what crazyflie-ros hands cflib's send_setpoint:
+ *   MELLINGER  [roll, pitch, yaw] degrees (attitude_cmd_clbk,
+ *              FIRMWARE_PITCH_SIGN = +1)
+ *   CTBR       [roll_rate, pitch_rate, yaw_rate] degrees/second
+ *              (send_ctbr_policy_command; the driver's own yaw negation
+ *              and the firmware's undo it, so the sign is the trainer's)
+ * The controller then applies what the radio path applies between the
+ * host and setpoint_t — cflib negates pitch on the wire — when it
+ * synthesizes the setpoint, so onboard and radio flights agree. */
 typedef struct {
-  float rollDeg;         /**< legacy attitude setpoint, degrees */
-  float pitchDeg;        /**< degrees, TRAINER sign (the firmware Mellinger
-                              negates internally — same convention the radio
-                              path delivers, FIRMWARE_PITCH_SIGN = +1) */
-  float yawDeg;          /**< degrees */
-  float thrustN;         /**< decoded collective, newtons */
-  float thrustPwm;       /**< 0..65535, the host-parity pre-decoder value */
-  float thrustSetpoint;  /**< what setpoint->thrust gets: the crtp_commander_rpyt
-                              clamp applied (0 below MIN_THRUST, capped at
-                              MAX_THRUST) so radio and onboard paths agree */
-} nnpolAttitudeCmd_t;
+  float ch[3];
+  float thrustN;         /**< setpoint kinds: decoded collective, newtons */
+  float thrustPwm;       /**< setpoint kinds: 0..65535, the host's pre-clamp value */
+  float thrustSetpoint;  /**< setpoint kinds: what setpoint->thrust gets — the
+                              crtp_commander_rpyt clamp applied (0 below
+                              MIN_THRUST, capped at MAX_THRUST) */
+  float rpm[4];          /**< MOTOR: mixer output x rpmScale, M1..M4 */
+  float motorPwm[4];     /**< MOTOR: 0..65535 per motor, rounded as the host's
+                              rpm_to_pwm rounds (np.rint) */
+} nnpolCmd_t;
 
 /** Reference position at time t (seconds), world frame, BEFORE the pushed
  * offset — the tasks/traj_lissajous figure-eight. */
@@ -59,10 +84,13 @@ void nnpolRef(float t, float out[3]);
  * [quat_wxyz, v_B, omega_B, e_B (NNPOL_N_SAMPLES x 3, row-major)]. */
 void nnpolBuildObs(const nnpolSnapshot_t* snap, float obs[NNPOL_OBS_DIM]);
 
-/** Clipped action in [-1, 1]^4 -> attitude/thrust command. `vnom` is the
- * battery voltage the thrust map assumes (nnpol.vnom, pushed at engage —
- * the same fixed voltage the host uses, for shadow parity). */
+/** Clipped action in [-1, 1]^4 -> command, along the checkpoint's decode
+ * path. `vnom` is the battery voltage every thrust/rpm-to-PWM map assumes
+ * (nnpol.vnom, pushed at engage — the same fixed voltage the host uses,
+ * for shadow parity); `rpmScale` is the MOTOR kind's hover-point
+ * calibration knob (nnpol.rpmScale, the host's motor_pwm.rpm_scale),
+ * ignored by the setpoint kinds. */
 void nnpolDecodeAction(const float action[NNPOL_ACTION_DIM], float vnom,
-                       nnpolAttitudeCmd_t* out);
+                       float rpmScale, nnpolCmd_t* out);
 
 #endif /* NNPOL_H */

@@ -16,8 +16,10 @@ checks, in order of what would hurt most in the air:
      observation (quaternion sign, R^T rotations, lookahead window).
   3. action-decode parity — random clipped actions through
      nnpolDecodeAction vs a numpy transcription of the deployed host path
-     (box decode, degrees, rpm2thrust inverse, vmotor2rpm, np.rint, the
-     legacy radio clamp).
+     for the build's NNPOL_ACTION_KIND: box decode, degrees (or deg/s),
+     rpm2thrust inverse, vmotor2rpm, np.rint, the legacy radio clamp for
+     the setpoint kinds; the checkpoint's mixer, rpm_scale and rpm_to_pwm
+     for the MOTOR kind.
   4. end to end — snapshot -> obs -> network -> clip -> decode in one C
      pass vs the same chain in numpy.
 
@@ -45,7 +47,10 @@ DEFAULT_RUN = (HERE.parent.parent.parent.parent
                / "mjc_dronetests/runs/traj_lissajous/ppo_body_yawpen")
 
 SNAP_FLOATS = 17
-CMD_FLOATS = 6
+CMD_FLOATS = 14   # nnpolCmd_t flattened, see test_policy_host.c
+VNOM = 4.0
+RPM_SCALE = 1.0
+KIND_MELLINGER, KIND_CTBR, KIND_MOTOR = 0, 1, 2
 
 
 def parse_defines(path):
@@ -70,7 +75,7 @@ def build(tmp):
         [cc, "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(exe),
          str(HERE / "test_policy_host.c"),
          str(SRC / "policy.c"), str(SRC / "nnpol_obs_lissajous.c"),
-         str(SRC / "nnpol_action_mellinger.c"),
+         str(SRC / "nnpol_action.c"),
          "-I", str(SRC), "-lm"], check=True)
     return exe
 
@@ -112,19 +117,55 @@ def np_obs(snap, C):
     return np.concatenate([q, R.T @ v_w, np.radians(gyro), (e_w @ R).reshape(-1)])
 
 
-def np_decode(action, vnom, C):
+def np_rpm_to_pwm(rpm, vnom, C):
+    v = (np.asarray(rpm, dtype=np.float64) - C["NNPOL_VMOTOR2RPM_K0"]) / C["NNPOL_VMOTOR2RPM_K1"]
+    return np.clip(np.rint(65535.0 * v / vnom), 0, 65535)
+
+
+def np_mix(a, C):
+    """crazyflow_interface/_mixer.py, by the build's NNPOL_MIXER."""
+    hover, max_rpm = C["NNPOL_HOVER_RPM"], C["NNPOL_MAX_RPM"]
+
+    def mix_rpm_action(x):
+        return np.where(x <= 0, (x + 1.0) * hover, hover + (max_rpm - hover) * x)
+
+    mixer = int(C["NNPOL_MIXER"])
+    if mixer == 0:   # attitude
+        collective = mix_rpm_action(a[0])
+        s = C["NNPOL_DIFFERENTIAL_FRAC"] * hover
+        roll, pitch, yaw = a[1], a[2], a[3]
+        rpm = np.array([collective + roll * s - pitch * s - yaw * s,
+                        collective - roll * s - pitch * s + yaw * s,
+                        collective - roll * s + pitch * s - yaw * s,
+                        collective + roll * s + pitch * s + yaw * s])
+        return np.clip(rpm, 0.0, max_rpm)
+    if mixer == 2:   # rpm_direct
+        return max_rpm * (a + 1.0) * 0.5
+    return mix_rpm_action(a)
+
+
+def np_decode(action, vnom, rpm_scale, C):
+    """nnpolCmd_t as numpy, for the build's NNPOL_ACTION_KIND: the host
+    decoders transcribed (MellingerAttitudePolicy / BodyRatePolicy /
+    MotorPwmRacingPolicy.decode + the wire and radio-clamp steps)."""
     a = np.clip(action, -1, 1)
+    out = np.zeros(CMD_FLOATS)
+    if int(C["NNPOL_ACTION_KIND"]) == KIND_MOTOR:
+        rpm = np_mix(a, C) * rpm_scale
+        out[6:10] = rpm
+        out[10:14] = np_rpm_to_pwm(rpm, vnom, C)
+        return out
     sp = C["NNPOL_ACTION_MID"] + a * C["NNPOL_ACTION_HALF"]
     a0, a1, a2 = (C["NNPOL_RPM2THRUST_A0"], C["NNPOL_RPM2THRUST_A1"],
                   C["NNPOL_RPM2THRUST_A2"])
     f = max(sp[3], 0.0) / 4.0
     disc = a1 * a1 - 4 * a2 * (a0 - f)
     rpm = 0.0 if disc < 0 else (-a1 + np.sqrt(disc)) / (2 * a2)
-    v = (rpm - C["NNPOL_VMOTOR2RPM_K0"]) / C["NNPOL_VMOTOR2RPM_K1"]
-    pwm = float(np.rint(np.clip(65535.0 * v / vnom, 0, 65535)))
+    pwm = float(np_rpm_to_pwm(rpm, vnom, C))
     applied = 0.0 if pwm < 1000.0 else min(pwm, 60000.0)
-    return np.array([np.degrees(sp[0]), np.degrees(sp[1]), np.degrees(sp[2]),
-                     sp[3], pwm, applied])
+    out[:6] = [np.degrees(sp[0]), np.degrees(sp[1]), np.degrees(sp[2]),
+               sp[3], pwm, applied]
+    return out
 
 
 def np_forward(layers, obs):
@@ -164,8 +205,20 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="nnpol_parity_"))
     exe = build(tmp)
     C = parse_defines(SRC / "firmware_export.h")
+    kind = int(subprocess.run([str(exe), "kind"], capture_output=True, check=True).stdout)
+    assert kind == int(C["NNPOL_ACTION_KIND"]), (kind, C["NNPOL_ACTION_KIND"])
+    print(f"[info] build decodes as kind {kind} "
+          f"({['MELLINGER', 'CTBR', 'MOTOR'][kind]}, action_type in policy.h)")
     rng = np.random.default_rng(0)
     failures = []
+    # The columns each kind fills, and their tolerances: angles/rates and
+    # newtons are float math; PWM columns are integers where rintf and
+    # np.rint can differ by one count at an exact .5 boundary.
+    if kind == KIND_MOTOR:
+        # rpm columns are O(1e4): float32 carries ~1e-3 rpm of rounding
+        col_f, col_i, tol_f, tol_e2e = slice(6, 10), slice(10, 14), 0.05, 0.5
+    else:
+        col_f, col_i, tol_f, tol_e2e = slice(0, 4), slice(4, 6), 1e-3, 5e-3
 
     def check(name, err, bound):
         ok = err < bound
@@ -186,26 +239,28 @@ def main():
 
     # 3. action decode parity
     acts = rng.uniform(-1.2, 1.2, (args.snapshots, 4))  # beyond the box: clip must match
-    payload = np.concatenate([acts, np.full((len(acts), 1), 4.0)], axis=1)
-    cmd_c = run(exe, "act", payload, CMD_FLOATS)
-    cmd_np = np.stack([np_decode(a, 4.0, C) for a in acts])
-    check("decode angles/thrustN", np.abs(cmd_c[:, :4] - cmd_np[:, :4]).max(), 1e-3)
-    # pwm: rintf vs np.rint can differ by 1 count at exact .5 boundaries
-    check("decode pwm", np.abs(cmd_c[:, 4:] - cmd_np[:, 4:]).max(), 1.001)
+    tail = np.tile([VNOM, RPM_SCALE], (len(acts), 1))
+    cmd_c = run(exe, "act", np.concatenate([acts, tail], axis=1), CMD_FLOATS)
+    cmd_np = np.stack([np_decode(a, VNOM, RPM_SCALE, C) for a in acts])
+    check("decode float channels", np.abs(cmd_c[:, col_f] - cmd_np[:, col_f]).max(), tol_f)
+    check("decode pwm", np.abs(cmd_c[:, col_i] - cmd_np[:, col_i]).max(), 1.001)
+    other = [i for i in range(CMD_FLOATS) if i not in range(*col_f.indices(CMD_FLOATS))
+             and i not in range(*col_i.indices(CMD_FLOATS))]
+    check("decode leaves the other kind's columns zero", np.abs(cmd_c[:, other]).max(), 0.5)
 
     # 4. end to end
     import json
     with open(args.run_dir / "config.json") as f:
         cfg = json.load(f)
     layers = load_layers(args.run_dir, cfg)
-    payload = np.concatenate([snaps, np.full((len(snaps), 1), 4.0)], axis=1)
-    full_c = run(exe, "full", payload, CMD_FLOATS)
+    tail = np.tile([VNOM, RPM_SCALE], (len(snaps), 1))
+    full_c = run(exe, "full", np.concatenate([snaps, tail], axis=1), CMD_FLOATS)
     full_np = np.stack([
         np_decode(np.clip(np_forward(layers, obs_np[i].astype(np.float32)), -1, 1),
-                  4.0, C)
+                  VNOM, RPM_SCALE, C)
         for i in range(len(snaps))])
-    check("end-to-end angles/thrustN", np.abs(full_c[:, :4] - full_np[:, :4]).max(), 5e-3)
-    check("end-to-end pwm", np.abs(full_c[:, 4:] - full_np[:, 4:]).max(), 2.001)
+    check("end-to-end float channels", np.abs(full_c[:, col_f] - full_np[:, col_f]).max(), tol_e2e)
+    check("end-to-end pwm", np.abs(full_c[:, col_i] - full_np[:, col_i]).max(), 2.001)
 
     # 5. optional: real-flight observations from the shadow's bag export
     if args.bag_npz is not None:

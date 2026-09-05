@@ -17,6 +17,10 @@
 
 #define NNPOL_OBS_DIM 40
 #define NNPOL_ACTION_DIM 4
+// HAND-INSERTED (the source run dir is no longer on disk): the decode path
+// export_policy_c.py now emits. 0 = MELLINGER. Re-export before flying -
+// the identity hash also changed (hover_rpm/max_rpm are hashed now).
+#define NNPOL_ACTION_KIND 0
 #define NNPOL_CTRL_FREQ_HZ 100
 
 #define NNPOL_HASH0 0x6511E007u

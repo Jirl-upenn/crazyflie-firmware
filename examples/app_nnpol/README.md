@@ -9,17 +9,29 @@ crazyflie-ros' `exec: onboard` (branch `onboard`).
 ## How it works
 
 - `CONFIG_CONTROLLER_OOT` registers this app as `stabilizer.controller = 6`.
-  With `nnpol.enable = 0` (default) the radio setpoint passes straight
-  through to `controllerMellingerFirmware` — identical flight behaviour to
-  `stabilizer.controller = 2`, which is validation step 1.
+  The checkpoint's `action_type` (exported as `NNPOL_ACTION_KIND`) selects
+  the inner controller the app wraps: firmware Mellinger for `mellinger`/
+  `mellinger30`, the stock PID for `ctbr` (rate mode) and for the rpm family
+  (`attitude`/`rpm`/`rpm_direct`, through controller_pid.c's per-motor
+  `modeMotorPwm` bypass). With `nnpol.enable = 0` (default) the radio
+  setpoint passes straight through to that controller — identical flight
+  behaviour to `stabilizer.controller = 2` or `1`, which is validation
+  step 1. The driver therefore needs `onboard_controller: oot` for a
+  Mellinger checkpoint and `oot_rate` for the other two (controller 6 with
+  the legacy packet read as rates).
 - On every policy tick (`nnpol.ctrlHz`, a writable param defaulting to the
   checkpoint's `ctrl_freq`; the host pushes `policy.inference_hz` from
   `config.yaml` before engaging) the controller snapshots the EKF state + gyro and notifies
   the app task, which builds the observation, runs the network
   (`policy.c`, weights `const` in flash), decodes the action into an
-  attitude/thrust setpoint and publishes it into a sequence-locked buffer.
-  The controller applies the newest complete action as a zero-order hold.
-  Inference never runs in the 1 kHz stabilizer context.
+  setpoint (attitude, body rates, or per-motor PWM) and publishes it into
+  a sequence-locked buffer. The controller applies the newest complete
+  action as a zero-order hold, synthesizing the `setpoint_t` the same
+  command would have produced arriving by radio — INCLUDING cflib's pitch
+  negation on the wire, which the phase-1 decoder missed (it wrote +pitch;
+  bench-check `nnpol.spPitch` against a `/attitude_cmd` pitch step before
+  the first onboard flight). Inference never runs in the 1 kHz stabilizer
+  context.
 - The host keeps streaming `/attitude_cmd` as the commander-watchdog
   keepalive and shadow reference; clearing `nnpol.enable` mid-flight is an
   instantaneous, format-compatible takeover by that stream.
@@ -38,7 +50,7 @@ crazyflie-ros' `exec: onboard` (branch `onboard`).
 |---|---|
 | `src/nnpol_controller.c` | firmware glue: OOT controller, app task, params, logs, scheduling |
 | `src/nnpol_obs_lissajous.c` | the `traj_lissajous/body` observation (pure C, host-testable) |
-| `src/nnpol_action_mellinger.c` | action box decode + thrust→PWM map (pure C, host-testable) |
+| `src/nnpol_action.c` | action decode for all three kinds: setpoint box + thrust→PWM map, or mixer + rpm→PWM (pure C, host-testable) |
 | `src/policy.c/.h` | GENERATED — the network, `const` fp32 weights |
 | `src/firmware_export.h` | GENERATED — dims, rate, action box, task constants, hash |
 | `test/` | host parity harness (plain gcc) + python runner |
@@ -84,13 +96,16 @@ numpy transcriptions: network < 1e-5, observation < 2e-4, decode < 1e-3.
 
 Params (`nnpol.`): `enable` (u8, the engage switch), `startPhase` (s),
 `offX/offY/offZ` (m, the host's curve pin), `vnom` (V, thrust-map battery
-voltage), `ctrlHz` (policy rate, default = trained `ctrl_freq`) — all
+voltage), `rpmScale` (MOTOR kind's rpm multiplier), `ctrlHz` (policy rate,
+default = trained `ctrl_freq`) — all
 latched at the `enable` rising edge; read-only: identity `hash0-3`,
 `obsDim`, `actDim`, and `runHz` (the rate the engaged run steps at).
 
 Logs (`nnpol.`): `t`, `act0-3` (clipped network output), `spRoll/Pitch/
-Yaw/Thrust` (decoded setpoint, deg + legacy thrust), `vbx/y/z`, `wbx/y/z`,
-`e0x/y/z` (observation excerpts), `us` (inference time), `stale`, `seq`.
+Yaw/Thrust` (decoded setpoint in the host's wire units: deg or deg/s, +
+legacy thrust), `pwm0-3` (MOTOR kind's per-motor PWM), `vbx/y/z`,
+`wbx/y/z`, `e0x/y/z` (observation excerpts), `us` (inference time),
+`stale`, `seq`.
 
 ## Engage protocol (what the ROS side does)
 
@@ -99,7 +114,8 @@ Yaw/Thrust` (decoded setpoint, deg + legacy thrust), `vbx/y/z`, `wbx/y/z`,
    inference rate divides 1000;
 2. take off, hover at the curve's engage point, keep streaming
    `/attitude_cmd` (shadow);
-3. push `startPhase`, `offX/Y/Z` (from the host's pin), `vnom`, `ctrlHz`;
+3. push `startPhase`, `offX/Y/Z` (from the host's pin), `vnom`, `rpmScale`,
+   `ctrlHz`;
 4. set `enable = 1`, confirm by readback → onboard flight;
 5. abort/land: clear `enable` first — the host stream takes over on the
    next controller tick.
