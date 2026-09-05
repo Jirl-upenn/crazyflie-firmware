@@ -96,7 +96,7 @@ typedef struct {
 /** A validated slot: its header and the weights behind it. */
 typedef struct {
   const nnpolSlotHeader_t* hdr;
-  const float* weights;
+  const uint16_t* weights;   /**< fp16, see nnpol_slot.h */
 } nnpolPolicy_t;
 
 /** Reference position at time t (seconds), world frame, BEFORE the yaw

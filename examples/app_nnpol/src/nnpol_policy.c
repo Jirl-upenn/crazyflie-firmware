@@ -52,6 +52,45 @@ static inline float fast_tanhf(float x)
 
 static inline float reluf(float x) { return x > 0.0f ? x : 0.0f; }
 
+/* One fp16 weight -> float. On the target GCC's __fp16 (the firmware
+ * builds with -mfp16-format=ieee) is a single vcvtb.f32.f16 after the
+ * halfword load; the host parity build has no such type and converts in
+ * software. Both are exact - every half is representable in binary32 -
+ * so the two paths agree bit for bit. */
+#if defined(__ARM_FP16_FORMAT_IEEE)
+static inline float h2f(uint16_t h)
+{
+  __fp16 v;
+  memcpy(&v, &h, sizeof(v));
+  return (float)v;
+}
+#else
+static inline float h2f(uint16_t h)
+{
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t mant = h & 0x3FFu;
+  uint32_t bits;
+  if (exp == 0u) {
+    if (mant == 0u) {
+      bits = sign;
+    } else {
+      int32_t e = 127 - 15 + 1;
+      while ((mant & 0x400u) == 0u) { mant <<= 1; e--; }
+      mant &= 0x3FFu;
+      bits = sign | ((uint32_t)e << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    bits = sign | 0x7F800000u | (mant << 13);
+  } else {
+    bits = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+  }
+  float f;
+  memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+#endif
+
 static inline float activate(uint16_t kind, float x)
 {
   return kind == NNPOL_ACT_RELU ? reluf(x) : fast_tanhf(x);
@@ -66,27 +105,29 @@ void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTI
   const uint16_t activation = h->activation;
   float bufA[NNPOL_MAX_HIDDEN], bufB[NNPOL_MAX_HIDDEN];
   const float* in = obs;
-  const float* w = p->weights;
+  const uint16_t* w = p->weights;
 
   for (int l = 0; l < numLayers; l++) {
     const int inDim = h->layerDims[l];
     const int outDim = h->layerDims[l + 1];
     const int isLast = (l == numLayers - 1);
-    const float* kernel = w;
-    const float* bias = w + inDim * outDim;
+    const uint16_t* kernel = w;
+    const uint16_t* bias = w + inDim * outDim;
     w = bias + outDim;
     float* out = isLast ? act : ((l & 1) ? bufB : bufA);
 
     int j = 0;
     for (; j + BLOCK <= outDim; j += BLOCK) {
-      const float* w0 = kernel + (j + 0) * inDim;
-      const float* w1 = kernel + (j + 1) * inDim;
-      const float* w2 = kernel + (j + 2) * inDim;
-      const float* w3 = kernel + (j + 3) * inDim;
-      float a0 = bias[j + 0], a1 = bias[j + 1], a2 = bias[j + 2], a3 = bias[j + 3];
+      const uint16_t* w0 = kernel + (j + 0) * inDim;
+      const uint16_t* w1 = kernel + (j + 1) * inDim;
+      const uint16_t* w2 = kernel + (j + 2) * inDim;
+      const uint16_t* w3 = kernel + (j + 3) * inDim;
+      float a0 = h2f(bias[j + 0]), a1 = h2f(bias[j + 1]);
+      float a2 = h2f(bias[j + 2]), a3 = h2f(bias[j + 3]);
       for (int k = 0; k < inDim; k++) {
         const float x = in[k];
-        a0 += x * w0[k]; a1 += x * w1[k]; a2 += x * w2[k]; a3 += x * w3[k];
+        a0 += x * h2f(w0[k]); a1 += x * h2f(w1[k]);
+        a2 += x * h2f(w2[k]); a3 += x * h2f(w3[k]);
       }
       if (isLast) {
         /* Final layer: raw linear output, no activation (models.Actor's
@@ -100,10 +141,10 @@ void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTI
       }
     }
     for (; j < outDim; j++) {
-      const float* wj = kernel + j * inDim;
-      float acc = bias[j];
+      const uint16_t* wj = kernel + j * inDim;
+      float acc = h2f(bias[j]);
       for (int k = 0; k < inDim; k++) {
-        acc += in[k] * wj[k];
+        acc += in[k] * h2f(wj[k]);
       }
       out[j] = isLast ? acc : activate(activation, acc);
     }

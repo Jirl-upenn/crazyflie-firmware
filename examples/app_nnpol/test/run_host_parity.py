@@ -338,8 +338,10 @@ def load_layers(run_dir, cfg):
     layers = []
     for i in range(len(cfg["hidden"]) + 1):
         d = params[f"Dense_{i}"]
-        layers.append((np.asarray(d["kernel"], dtype=np.float32),
-                       np.asarray(d["bias"], dtype=np.float32)))
+        # The slot carries fp16 weights: the numpy mirror rounds the same
+        # way, so it computes exactly what the interpreter computes.
+        layers.append((np.asarray(d["kernel"], dtype=np.float32).astype(np.float16).astype(np.float32),
+                       np.asarray(d["bias"], dtype=np.float32).astype(np.float16).astype(np.float32)))
     return layers
 
 

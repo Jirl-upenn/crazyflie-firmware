@@ -67,7 +67,7 @@ nnpolSlotStatus_t nnpolSlotValidate(const void* base, uint32_t capacityBytes)
     floats += in * out + out;
   }
   if (floats != h->payloadFloats
-      || h->headerBytes + floats * 4u != h->totalBytes) {
+      || h->headerBytes + nnpolSlotPayloadBytes(floats) != h->totalBytes) {
     return NNPOL_SLOT_BAD_SIZE;
   }
   const uint8_t* bytes = (const uint8_t*)base;

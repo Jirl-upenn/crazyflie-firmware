@@ -4,12 +4,15 @@
  * policy_slot.bin, uploaded over the radio into the app's RAM slot
  * (nnpol_slot_bank.c) at every controller start and selected by the
  * ground station by identity hash — so switching checkpoints is a
- * config.yaml edit, not a reflash. Everything the app needs is in the 256-byte header; the
- * network's fp32 weights follow it in the output-major layout the
- * interpreter (nnpol_policy.c) walks.
+ * config.yaml edit, not a reflash. Everything the app needs is in the
+ * 256-byte header; the network's weights follow it as IEEE fp16 - half the
+ * RAM of fp32, and the Cortex-M4F converts a half in one instruction - in
+ * the output-major layout the interpreter (nnpol_policy.c) walks: per
+ * layer the kernel as [out][in], then the bias. payloadFloats counts them;
+ * the payload is padded to a multiple of 4 bytes.
  *
  * Pure C, host-buildable: the parity harness validates a blob from a file
- * with exactly the code the firmware validates a flash slot with.
+ * with exactly the code the firmware validates the RAM slot with.
  *
  * LAYOUT IS A CONTRACT with export_policy_c._write_slot_blob (struct
  * format '<4I4I4H5HH4H4f4f3f3f2f8f64sI32s', 256 bytes, little-endian).
@@ -22,7 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NNPOL_SLOT_MAGIC 0x3153504Eu   /* "NPS1" as a little-endian u32 */
+#define NNPOL_SLOT_MAGIC 0x3253504Eu   /* "NPS2" as a little-endian u32: fp16 payload */
 #define NNPOL_SLOT_HEADER_BYTES 256u
 
 /* Decode paths (export_policy_c.ACTION_KIND_*). */
@@ -67,7 +70,7 @@
 typedef struct {
   uint32_t magic;            /*   0 NNPOL_SLOT_MAGIC */
   uint32_t headerBytes;      /*   4 NNPOL_SLOT_HEADER_BYTES */
-  uint32_t totalBytes;       /*   8 header + payload, multiple of 4 */
+  uint32_t totalBytes;       /*   8 header + fp16 payload (padded), multiple of 4 */
   uint32_t crc32;            /*  12 zlib crc32 over bytes [16, totalBytes) */
   uint32_t hash[4];          /*  16 identity hash words (firmware_export.json) */
   uint16_t obsDim;           /*  32 */
@@ -92,7 +95,7 @@ typedef struct {
                                     n_samples, samples_dt_s,
                                     default_start_phase_s, motorobs, gate_side] */
   char name[64];             /* 156 run directory name, NUL-padded */
-  uint32_t payloadFloats;    /* 220 weights after the header */
+  uint32_t payloadFloats;    /* 220 weights (fp16 each) after the header */
   uint8_t reserved[32];      /* 224 zeros */
 } nnpolSlotHeader_t;         /* 256 */
 
@@ -123,10 +126,16 @@ uint32_t nnpolCrc32(const uint8_t* data, uint32_t len, uint32_t seed);
  * layer bookkeeping (payloadFloats == sum of kernel + bias sizes), CRC. */
 nnpolSlotStatus_t nnpolSlotValidate(const void* base, uint32_t capacityBytes);
 
-/** The weights of a validated blob. */
-static inline const float* nnpolSlotWeights(const nnpolSlotHeader_t* hdr)
+/** The weights of a validated blob: fp16 bit patterns, payloadFloats of them. */
+static inline const uint16_t* nnpolSlotWeights(const nnpolSlotHeader_t* hdr)
 {
-  return (const float*)((const uint8_t*)hdr + hdr->headerBytes);
+  return (const uint16_t*)((const uint8_t*)hdr + hdr->headerBytes);
+}
+
+/** Bytes the payload occupies: 2 per weight, padded to a word. */
+static inline uint32_t nnpolSlotPayloadBytes(uint32_t payloadFloats)
+{
+  return (payloadFloats * 2u + 3u) & ~3u;
 }
 
 /** Human-readable status, for logs and the host harness. */

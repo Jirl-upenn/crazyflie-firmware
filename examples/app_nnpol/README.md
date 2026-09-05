@@ -17,9 +17,11 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
   are `policy_slot.bin` blobs written by `mjx-drone-trainer/export_policy_c.py`
   (a 256-byte header — identity hash, dims, activation, decode kind, action
   box or mixer anchors, thrust identification, task constants — plus the
-  fp32 weights) uploaded through the `MEM_TYPE_APP` memory handler into
-  ONE 48 KB RAM slot (`nnpol_slot_bank.c`; sized for the 64x64x64 family,
-  the exporter refuses anything larger) and selected with `nnpol.slot`.
+  weights as fp16, converted by one M4F instruction per weight as the
+  interpreter reads them) uploaded through the `MEM_TYPE_APP` memory
+  handler into ONE 28 KB RAM slot (`nnpol_slot_bank.c`; sized for the
+  64x64x64 family, the exporter refuses anything larger) and selected with
+  `nnpol.slot`.
   Nothing is ever written to flash. The app task validates the selected
   slot (CRC) and publishes its identity in the read-only `nnpol.hash0-3` /
   `obsDim` / `actDim` / `kind` / `taskId` / `ctrlHz` params, which the
@@ -79,7 +81,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
    while a policy is engaged or the vehicle armed). `nnpol.slotState` goes
    2 (erased) or 3 (failed).
 2. Stream `policy_slot.bin` with cflib's memory write (`MEM_TYPE_APP`,
-   offset `i * 49152`): sequential acknowledged 24-byte chunks, copied in
+   offset `i * 28672`): sequential acknowledged 24-byte chunks, copied in
    as they arrive (a retransmit rewrites the same bytes). `nnpol.writeSlot`
    / `writtenBytes` show progress.
 3. `nnpol.slot = i` — the app task validates (CRC over the whole blob) and
@@ -95,7 +97,7 @@ pixi run --manifest-path ../../pixi.toml make -j                 # build
 pixi run --manifest-path ../../pixi.toml make cload              # flash
 ```
 
-The slot is a 48 KB `.bss` buffer: check the RAM figure the build prints
+The slot is a 28 KB `.bss` buffer: check the RAM figure the build prints
 (`NNPOL_SLOT_BYTES` in `nnpol_slot_bank.h` is the knob if it ever has to
 shrink; the exporter's `SLOT_CAPACITY_BYTES` must match).
 

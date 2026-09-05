@@ -6,9 +6,10 @@
  * a checkpoint change is a config.yaml edit, and a power cycle simply
  * empties the slot until the next upload (a few seconds, on the ground).
  *
- * The slot is sized for the 64x64x64 family (fp32 weights, 41-46 KB with
- * the observations flown here); the exporter refuses a blob that would
- * not fit, and so does the validator. Firmware-only (mem subsystem,
+ * The blob's weights are fp16 (nnpol_slot.h), which is what makes one
+ * slot fit next to everything else in the F405's 128 KB of SRAM: the
+ * 64x64x64 family is 21-26 KB. The exporter refuses a blob that would not
+ * fit, and so does the validator. Firmware-only (mem subsystem,
  * supervisor); the format itself is in nnpol_slot_format.c.
  */
 #ifndef NNPOL_SLOT_BANK_H
@@ -19,12 +20,12 @@
 
 #include "nnpol_slot.h"
 
-/** Bytes one slot holds: 48 KB, plain .bss in the F405's 128 KB SRAM.
- * A 64x64x64 checkpoint needs 256 + 4 * (obs*64 + 64 + 2*(64*64 + 64) +
- * 64*4 + 4) bytes: 41.2 KB at obs 25, 45.1 KB at obs 40, 46.1 KB at
- * obs 44; an observation wider than 55 no longer fits and the exporter
- * refuses it. Raise it only against the build's RAM report. */
-#define NNPOL_SLOT_BYTES 0xC000u
+/** Bytes one slot holds: 28 KB, plain .bss in the F405's 128 KB SRAM
+ * (the build had 34 KB spare before it). A 64x64x64 checkpoint needs
+ * 256 + 2 * (obs*64 + 64 + 2*(64*64 + 64) + 64*4 + 4) bytes: 20.8 KB at
+ * obs 25, 22.7 KB at obs 40, 25.7 KB at the interpreter's obs limit of
+ * 64. Raise it only against the build's RAM report. */
+#define NNPOL_SLOT_BYTES 0x7000u
 #define NNPOL_NUM_SLOTS 1u
 #define NNPOL_SLOT_NONE 255u
 
