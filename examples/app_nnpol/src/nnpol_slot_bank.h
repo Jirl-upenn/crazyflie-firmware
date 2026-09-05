@@ -29,7 +29,9 @@
 #define NNPOL_NUM_SLOTS 1u
 #define NNPOL_SLOT_NONE 255u
 
-/** Register the MEM_TYPE_APP handler and empty the slot. */
+/** Register the MEM_TYPE_APP handler and empty the slot. Call from
+ * controllerOutOfTreeInit (boot, before crtp_mem closes registration);
+ * idempotent. */
 void nnpolSlotBankInit(void);
 
 /** The slot's header (raw buffer; validate before trusting). */

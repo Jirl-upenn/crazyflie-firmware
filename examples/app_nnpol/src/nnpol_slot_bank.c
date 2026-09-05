@@ -144,7 +144,12 @@ static const MemoryHandlerDef_t memDef = {
 
 void nnpolSlotBankInit(void)
 {
+  static bool isInit = false;
+  if (isInit) {
+    return;   /* controllerOutOfTreeInit runs again on every controller switch */
+  }
   memset(bank, 0xFF, sizeof(bank));
   nnpolSlotBankRescan();
-  memoryRegisterHandler(&memDef);
+  memoryRegisterHandler(&memDef);   /* must precede crtp_mem's memBlockHandlerRegistration */
+  isInit = true;
 }

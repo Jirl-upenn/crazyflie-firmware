@@ -362,7 +362,11 @@ static void housekeeping(void)
 void appMain()
 {
   appTaskHandle = xTaskGetCurrentTaskHandle();
-  nnpolSlotBankInit();
+  /* The slot registered its memory handler in controllerOutOfTreeInit, at
+   * boot, before crtp_mem's task closed registration. Registering from
+   * here (after systemStart) trips ASSERT(registrationEnabled) in
+   * mem.c, which reboots the vehicle, whose next boot then fails its
+   * self-test on cfAssertNormalStart and never starts this task. */
   paramSlotValid = nnpolSlotBankValidMask();
   DEBUG_PRINT("nnpol: %d slots, valid mask 0x%02x\n", NNPOL_NUM_SLOTS, paramSlotValid);
 
@@ -446,6 +450,14 @@ static uint32_t tickDividerFor(uint16_t hz)
 
 void controllerOutOfTreeInit()
 {
+  /* Boot order (system.c): memInit, deckInit, stabilizerInit - which
+   * lands here because this build makes the OOT controller the default -
+   * then crtpMemInit, whose task closes memory-handler registration for
+   * good. This is therefore the one place the slot can register its
+   * MEM_TYPE_APP handler; nnpolSlotBankInit is idempotent, so the
+   * controller switches the driver makes later (pid <-> oot) neither
+   * re-register nor wipe an uploaded policy. */
+  nnpolSlotBankInit();
   controllerMellingerFirmwareInit();
   controllerPidInit();
   wasEnabled = false;
