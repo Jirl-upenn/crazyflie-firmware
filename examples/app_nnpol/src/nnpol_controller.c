@@ -488,7 +488,7 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
                          const uint32_t tick)
 {
   const bool enabled = (nnpolEnable != 0) && activeValid;
-  nnpolSlotBankSetLocked(nnpolEnable != 0 || supervisorIsArmed());
+  nnpolSlotBankSetLocked(nnpolEnable != 0);   /* flying is checked by the bank itself */
 
   if (enabled && !wasEnabled) {
     /* Rising edge: the curve clock starts NOW, with the values the host

@@ -78,7 +78,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 ## Slot protocol (what the ROS driver does)
 
 1. `nnpol.slotErase = i` — the app task empties the slot (instant; refused
-   while a policy is engaged or the vehicle armed). `nnpol.slotState` goes
+   while a policy is engaged or the vehicle is flying). `nnpol.slotState` goes
    2 (erased) or 3 (failed).
 2. Stream `policy_slot.bin` with cflib's memory write (`MEM_TYPE_APP`,
    offset `i * 28672`): sequential acknowledged 24-byte chunks, copied in

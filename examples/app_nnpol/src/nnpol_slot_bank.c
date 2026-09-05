@@ -68,9 +68,14 @@ void nnpolSlotBankSetLocked(bool locked) { bankLocked = locked; }
 uint8_t nnpolSlotBankWriteSlot(void) { return writeSlot; }
 uint32_t nnpolSlotBankWrittenBytes(void) { return writtenBytes; }
 
+/* The slot may be rewritten whenever the interpreter is not reading it
+ * and the vehicle is on the ground. Armed is NOT a reason to refuse: with
+ * CONFIG_MOTORS_REQUIRE_ARMING the ground station arms before takeoff,
+ * and a controller restart on an armed, landed vehicle must still be able
+ * to upload its checkpoint. */
 static bool writesAllowed(void)
 {
-  return !bankLocked && !supervisorIsArmed();
+  return !bankLocked && !supervisorIsFlying();
 }
 
 bool nnpolSlotBankErase(uint8_t slot)

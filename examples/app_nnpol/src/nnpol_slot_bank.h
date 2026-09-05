@@ -48,7 +48,7 @@ nnpolSlotStatus_t nnpolSlotBankStatus(uint8_t slot);
 bool nnpolSlotBankErase(uint8_t slot);
 
 /** Locked = an engaged policy is reading the slot: uploads and erases are
- * refused until it is released. */
+ * refused until it is released (and while flying, see writesAllowed). */
 void nnpolSlotBankSetLocked(bool locked);
 
 /** Upload progress, for the nnpol.writeSlot / writtenBytes params. */
