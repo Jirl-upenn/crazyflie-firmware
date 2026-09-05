@@ -40,6 +40,8 @@
 #define NNPOL_TASK_LISSAJOUS_BODY 0    /* traj_lissajous / body[_motorobs]: the fixed eight */
 #define NNPOL_TASK_EASY_BODY 1         /* traj_easy / body[_motorobs]: a per-run curve
                                           pushed at engage (nnpol.c*) */
+#define NNPOL_TASK_RACE_V3 2           /* race / v3[_motorobs]: the pinned track is
+                                          pushed at engage (nnpol.g*); nnpol_obs_race.c */
 #define NNPOL_TASK_UNSUPPORTED 0xFFFF  /* exported, uploadable, but cannot engage */
 /* task[] indices shared by both builders (export_policy_c.slot_task). */
 #define NNPOL_TASK_T_PERIOD 0          /* LISSAJOUS: fundamental period, s */
@@ -49,6 +51,8 @@
 #define NNPOL_TASK_SAMPLES_DT 4        /* lookahead spacing, s */
 #define NNPOL_TASK_START_PHASE 5       /* LISSAJOUS: default engage phase, s */
 #define NNPOL_TASK_MOTOROBS 6          /* != 0: append 4 normalized rotor speeds */
+#define NNPOL_TASK_GATE_SIDE 7         /* RACE: gate side length, m (the crossing square) */
+#define NNPOL_MAX_GATES 8              /* RACE: the pushed track's capacity */
 /* Rotor-speed normalizer of the motorobs observations: the trainer's
  * NOMINAL_HOVER_RPM (every tasks package: 15896.3; crazyflie-ros TaskObs). */
 #define NNPOL_NOMINAL_HOVER_RPM 15896.296489245326f
@@ -86,7 +90,7 @@ typedef struct {
   float task[8];             /* 124 task constants, NNPOL_TASK_* indices:
                                     [T_period_s, amplitude_m, center_z_m,
                                     n_samples, samples_dt_s,
-                                    default_start_phase_s, motorobs, 0] */
+                                    default_start_phase_s, motorobs, gate_side] */
   char name[64];             /* 156 run directory name, NUL-padded */
   uint32_t payloadFloats;    /* 220 weights after the header */
   uint8_t reserved[32];      /* 224 zeros */

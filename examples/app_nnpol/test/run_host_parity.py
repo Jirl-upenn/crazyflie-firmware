@@ -48,7 +48,8 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 
-SNAP_FLOATS = 35   # + curve(13) + rpm(4), see test_policy_host.c
+SNAP_FLOATS = 85   # + curve(13) + rpm(4) + race(2 + 8*3 + 8*3), see test_policy_host.c
+MAX_GATES = 8
 NOMINAL_HOVER_RPM = 15896.296489245326
 CMD_FLOATS = 14   # nnpolCmd_t flattened, see test_policy_host.c
 VNOM = 4.0
@@ -56,6 +57,7 @@ RPM_SCALE = 1.0
 KIND_MELLINGER, KIND_CTBR, KIND_MOTOR = 0, 1, 2
 TASK_LISSAJOUS_BODY = 0
 TASK_EASY_BODY = 1
+TASK_RACE_V3 = 2
 
 # nnpol_slot.h, mirrored (export_policy_c._SLOT_HEADER_FORMAT).
 HEADER_FORMAT = "<4I4I4H5HH4H4f4f3f3f2f8f64sI32s"
@@ -96,6 +98,7 @@ def parse_header(blob):
         "NNPOL_VMOTOR2RPM_K0": vmotor2rpm[0], "NNPOL_VMOTOR2RPM_K1": vmotor2rpm[1],
         "NNPOL_T_PERIOD_S": task[0], "NNPOL_AMPLITUDE_M": task[1], "NNPOL_CENTER_Z_M": task[2],
         "NNPOL_N_SAMPLES": task[3], "NNPOL_SAMPLES_DT_S": task[4], "motorobs": task[6] != 0.0,
+        "gate_side": task[7],
     }
 
 
@@ -108,7 +111,8 @@ def build(tmp):
         [cc, "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(exe),
          str(HERE / "test_policy_host.c"),
          str(SRC / "nnpol_slot_format.c"), str(SRC / "nnpol_policy.c"),
-         str(SRC / "nnpol_obs_lissajous.c"), str(SRC / "nnpol_action.c"),
+         str(SRC / "nnpol_obs_lissajous.c"), str(SRC / "nnpol_obs_race.c"),
+         str(SRC / "nnpol_action.c"),
          "-I", str(SRC), "-lm"], check=True)
     return exe
 
@@ -158,9 +162,43 @@ def np_ref(t, C, curve=None):
                      + C["NNPOL_CENTER_Z_M"]], axis=-1)
 
 
+def np_race_obs(snap, C):
+    """RaceV3.observe: body velocity/rate, gravity in body, the current and
+    next gate's offset and approach normal in body, [+ rotor speeds]."""
+    pos, q, v_w, gyro, rpm = snap[4:7], snap[7:11], snap[11:14], snap[14:17], snap[31:35]
+    n_gates, idx = int(snap[35]), int(snap[36])
+    gates = snap[37:37 + 3 * MAX_GATES].reshape(MAX_GATES, 3)
+    normals = snap[61:61 + 3 * MAX_GATES].reshape(MAX_GATES, 3)
+    R = quat_to_R(q / np.linalg.norm(q))
+    Rt = R.T
+    nxt = (idx + 1) % n_gates
+    parts = [Rt @ v_w, np.radians(gyro), R[2, :],
+             Rt @ (gates[idx] - pos), Rt @ (gates[nxt] - pos),
+             Rt @ normals[idx], Rt @ normals[nxt]]
+    if C["motorobs"]:
+        parts.append(rpm)
+    return np.concatenate(parts)
+
+
+def np_update_gate(track, gate_side, pos, gate_idx, prev_gate_x):
+    """RaceV3._update_gate / RacePlugin.step's crossing test."""
+    n_gates, gates, normals = track
+    g, n = gates[gate_idx], normals[gate_idx]
+    rel = pos - g
+    x = float(np.dot(rel, n))
+    y = rel[1] * n[0] - rel[0] * n[1]
+    z = rel[2]
+    half = gate_side * 0.5
+    if x < 0.0 and prev_gate_x > 0.0 and abs(y) < half and abs(z) < half:
+        return (gate_idx + 1) % n_gates, 1.0
+    return gate_idx, x
+
+
 def np_obs(snap, C):
     """TrajLissajousBody.observe with the anchor: quaternion of R_tw^T R_wb,
     body velocity and rate, lookahead of the curve yawed by R_tw."""
+    if C["task_id"] == TASK_RACE_V3:
+        return np_race_obs(snap, C)
     t, off, pos = snap[0], snap[1:4], snap[4:7]
     q, v_w, gyro, yaw0 = snap[7:11].copy(), snap[11:14], snap[14:17], snap[17]
     curve, rpm = snap[18:31], snap[31:35]
@@ -259,9 +297,29 @@ def random_snapshots(rng, n, C):
     snaps[:, 27:30] = np.stack([np.zeros(n), np.zeros(n), rng.uniform(0.8, 1.2, n)], axis=1)
     snaps[:, 30] = rng.uniform(-np.pi, np.pi, n)                        # curve yaw
     snaps[:, 31:35] = rng.uniform(0.6, 1.4, (n, 4))                     # rpm / nominal
+    # a race track per snapshot: 2-8 gates on a loop, horizontal normals
+    # against the travel direction (RacePlugin.from_config), the drone
+    # somewhere near one of them targeting a random gate
     for i in range(n):
-        ref0 = np_ref(snaps[i, 0], C, snaps[i, 18:31]) @ rot_z(snaps[i, 17]).T + snaps[i, 1:4]
-        snaps[i, 4:7] = ref0 + rng.uniform(-0.5, 0.5, 3)                # pos
+        n_gates = int(rng.integers(2, MAX_GATES + 1))
+        thetas = np.sort(rng.uniform(-np.pi, np.pi, n_gates))
+        radius = rng.uniform(1.0, 3.0)
+        gates = np.stack([radius * np.cos(thetas), radius * np.sin(thetas),
+                          rng.uniform(0.5, 1.5, n_gates)], axis=1)
+        travel = thetas + np.pi / 2 + rng.uniform(-0.3, 0.3, n_gates)
+        normals = -np.stack([np.cos(travel), np.sin(travel), np.zeros(n_gates)], axis=1)
+        snaps[i, 35] = n_gates
+        snaps[i, 36] = rng.integers(0, n_gates)
+        snaps[i, 37:37 + 3 * n_gates] = gates.reshape(-1)
+        snaps[i, 61:61 + 3 * n_gates] = normals.reshape(-1)
+    if C["task_id"] == TASK_RACE_V3:
+        for i in range(n):
+            g = snaps[i, 37 + 3 * int(snaps[i, 36]):40 + 3 * int(snaps[i, 36])]
+            snaps[i, 4:7] = g + rng.uniform(-2.0, 2.0, 3)               # pos near the target
+    else:
+        for i in range(n):
+            ref0 = np_ref(snaps[i, 0], C, snaps[i, 18:31]) @ rot_z(snaps[i, 17]).T + snaps[i, 1:4]
+            snaps[i, 4:7] = ref0 + rng.uniform(-0.5, 0.5, 3)            # pos
     q = rng.normal(size=(n, 4))
     q /= np.linalg.norm(q, axis=1, keepdims=True)
     # half with w<0 on purpose: the C side must sign-normalize after anchoring
@@ -339,7 +397,7 @@ def main():
     act = run(exe, blob_path, "policy", ref["obs"], 4)
     check("network vs policy_reference.npz", np.abs(act - ref["act_raw"]).max(), 1e-5)
 
-    if C["task_id"] not in (TASK_LISSAJOUS_BODY, TASK_EASY_BODY):
+    if C["task_id"] not in (TASK_LISSAJOUS_BODY, TASK_EASY_BODY, TASK_RACE_V3):
         print("[skip] observation/end-to-end: no host mirror for task id %d" % C["task_id"])
         snaps = obs_np = None
     else:
@@ -348,6 +406,32 @@ def main():
         obs_c = run(exe, blob_path, "obs", snaps, int(C["NNPOL_OBS_DIM"]))
         obs_np = np.stack([np_obs(s.astype(np.float64), C) for s in snaps])
         check("observation vs numpy transcription", np.abs(obs_c - obs_np).max(), 2e-4)
+
+    # 3b. race gate state: one crossing-test step per record, positions
+    # drawn to land on every branch (approach side, crossing inside the
+    # square, crossing outside it, already past)
+    if C["task_id"] == TASK_RACE_V3:
+        recs, expect = [], []
+        for i in range(args.snapshots):
+            s = snaps[i].astype(np.float64)
+            n_gates, idx = int(s[35]), int(s[36])
+            gates = s[37:37 + 3 * MAX_GATES].reshape(MAX_GATES, 3)
+            normals = s[61:61 + 3 * MAX_GATES].reshape(MAX_GATES, 3)
+            side = float(C["gate_side"])
+            n_vec = normals[idx]
+            tang = np.array([-n_vec[1], n_vec[0], 0.0])
+            pos = (gates[idx] - rng.uniform(-0.3, 0.3) * n_vec
+                   + rng.uniform(-side, side) * tang + np.array([0, 0, rng.uniform(-side, side)]))
+            prev_x = rng.choice([1.0, 0.2, -0.1])
+            rec = np.concatenate([pos, [side, idx, prev_x, n_gates], gates.reshape(-1),
+                                  normals.reshape(-1)])
+            recs.append(rec)
+            expect.append(np_update_gate((n_gates, gates, normals), side, pos, idx, prev_x))
+        out = run(exe, blob_path, "gate", np.stack(recs), 2)
+        exp = np.array(expect)
+        check("gate crossing test (index)", np.abs(out[:, 0] - exp[:, 0]).max(), 0.5)
+        check("gate crossing test (prev x)", np.abs(out[:, 1] - exp[:, 1]).max(), 1e-4)
+        print("[info] gate test: %d of %d records crossed" % (int((exp[:, 1] == 1.0).sum()), len(exp)))
 
     # 4. action decode parity
     acts = rng.uniform(-1.2, 1.2, (args.snapshots, 4))  # beyond the box: clip must match

@@ -3,4 +3,5 @@ obj-y += nnpol_slot_bank.o
 obj-y += nnpol_slot_format.o
 obj-y += nnpol_policy.o
 obj-y += nnpol_obs_lissajous.o
+obj-y += nnpol_obs_race.o
 obj-y += nnpol_action.o
