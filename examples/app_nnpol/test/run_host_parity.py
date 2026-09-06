@@ -19,11 +19,10 @@ flash slot, then checks, in order of what would hurt most in the air:
      TrajLissajousBody.observe (anchored quaternion, R^T rotations, the
      yawed lookahead window).
   4. action-decode parity — random clipped actions through
-     nnpolDecodeAction vs a numpy transcription of the deployed host path
-     for the slot's action kind: box decode, the Mellinger yaw anchor,
-     degrees (or deg/s), rpm2thrust inverse, vmotor2rpm, np.rint, the
-     legacy radio clamp for the setpoint kinds; the checkpoint's mixer,
-     rpm_scale and rpm_to_pwm for the MOTOR kind.
+     nnpolDecodeAction vs a numpy transcription of the deployed host path:
+     the checkpoint's mixer, rpm_scale and rpm_to_pwm (onboard_only flies
+     the rpm family only; the runner refuses a slot of another kind, as
+     the firmware does).
   5. end to end — snapshot -> obs -> network -> clip -> decode in one C
      pass vs the same chain in numpy.
 
@@ -51,7 +50,7 @@ SRC = HERE.parent / "src"
 SNAP_FLOATS = 85   # + curve(13) + rpm(4) + race(2 + 8*3 + 8*3), see test_policy_host.c
 MAX_GATES = 8
 NOMINAL_HOVER_RPM = 15896.296489245326
-CMD_FLOATS = 14   # nnpolCmd_t flattened, see test_policy_host.c
+CMD_FLOATS = 8    # nnpolCmd_t flattened, see test_policy_host.c (rpm(4), pwm(4))
 VNOM = 4.0
 RPM_SCALE = 1.0
 KIND_MELLINGER, KIND_CTBR, KIND_MOTOR = 0, 1, 2
@@ -240,30 +239,14 @@ def np_mix(a, C):
     return mix_rpm_action(a)
 
 
-def np_decode(action, vnom, rpm_scale, yaw0, C):
-    """nnpolCmd_t as numpy, for the slot's action kind: the host decoders
-    transcribed (MellingerAttitudePolicy / BodyRatePolicy /
-    MotorPwmRacingPolicy.decode + the wire and radio-clamp steps)."""
+def np_decode(action, vnom, rpm_scale, C):
+    """nnpolCmd_t as numpy: MotorPwmRacingPolicy.decode transcribed - the
+    checkpoint's mixer, rpm_scale, rpm_to_pwm."""
     a = np.clip(action, -1, 1)
     out = np.zeros(CMD_FLOATS)
-    kind = int(C["NNPOL_ACTION_KIND"])
-    if kind == KIND_MOTOR:
-        rpm = np_mix(a, C) * rpm_scale
-        out[6:10] = rpm
-        out[10:14] = np_rpm_to_pwm(rpm, vnom, C)
-        return out
-    sp = C["NNPOL_ACTION_MID"] + a * C["NNPOL_ACTION_HALF"]
-    if kind == KIND_MELLINGER and yaw0:
-        sp[2] = (sp[2] + yaw0 + np.pi) % (2.0 * np.pi) - np.pi
-    a0, a1, a2 = (C["NNPOL_RPM2THRUST_A0"], C["NNPOL_RPM2THRUST_A1"],
-                  C["NNPOL_RPM2THRUST_A2"])
-    f = max(sp[3], 0.0) / 4.0
-    disc = a1 * a1 - 4 * a2 * (a0 - f)
-    rpm = 0.0 if disc < 0 else (-a1 + np.sqrt(disc)) / (2 * a2)
-    pwm = float(np_rpm_to_pwm(rpm, vnom, C))
-    applied = 0.0 if pwm < 1000.0 else min(pwm, 60000.0)
-    out[:6] = [np.degrees(sp[0]), np.degrees(sp[1]), np.degrees(sp[2]),
-               sp[3], pwm, applied]
+    rpm = np_mix(a, C) * rpm_scale
+    out[0:4] = rpm
+    out[4:8] = np_rpm_to_pwm(rpm, vnom, C)
     return out
 
 
@@ -383,14 +366,14 @@ def main():
     else:
         print("[ok] slot hash words match firmware_export.json")
     kind = int(C["NNPOL_ACTION_KIND"])
-    # The columns each kind fills, and their tolerances: angles/rates and
-    # newtons are float math; rpm columns are O(1e4) with ~1e-3 rpm of
-    # float32 rounding; PWM columns are integers where rintf and np.rint
-    # can differ by one count at an exact .5 boundary.
-    if kind == KIND_MOTOR:
-        col_f, col_i, tol_f, tol_e2e = slice(6, 10), slice(10, 14), 0.05, 0.5
-    else:
-        col_f, col_i, tol_f, tol_e2e = slice(0, 4), slice(4, 6), 1e-3, 5e-3
+    if kind != KIND_MOTOR:
+        print("[FAIL] onboard_only flies the rpm family only; this slot is kind %d and the "
+              "firmware refuses it (status 6)" % kind)
+        sys.exit(1)
+    # rpm columns are O(1e4) with ~1e-3 rpm of float32 rounding; PWM columns
+    # are integers where rintf and np.rint can differ by one count at an
+    # exact .5 boundary.
+    col_f, col_i, tol_f, tol_e2e = slice(0, 4), slice(4, 8), 0.05, 0.5
     rng = np.random.default_rng(0)
 
     # 2. network parity against the trainer's own reference
@@ -436,21 +419,11 @@ def main():
 
     # 4. action decode parity
     acts = rng.uniform(-1.2, 1.2, (args.snapshots, 4))  # beyond the box: clip must match
-    yaw0s = rng.uniform(-np.pi, np.pi, args.snapshots)
-    yaw0s[::3] = 0.0
-    tail = np.stack([np.full(len(acts), VNOM), np.full(len(acts), RPM_SCALE), yaw0s], axis=1)
+    tail = np.tile([VNOM, RPM_SCALE], (len(acts), 1))
     cmd_c = run(exe, blob_path, "act", np.concatenate([acts, tail], axis=1), CMD_FLOATS)
-    cmd_np = np.stack([np_decode(a, VNOM, RPM_SCALE, y, C) for a, y in zip(acts, yaw0s)])
-    # The wrapped yaw can land on either side of +-pi for the same command
-    # up to float32 rounding; compare it on the circle.
-    diff = cmd_c[:, col_f] - cmd_np[:, col_f]
-    if kind == KIND_MELLINGER:
-        diff[:, 2] = (diff[:, 2] + 180.0) % 360.0 - 180.0
-    check("decode float channels", np.abs(diff).max(), tol_f)
+    cmd_np = np.stack([np_decode(a, VNOM, RPM_SCALE, C) for a in acts])
+    check("decode rpm", np.abs(cmd_c[:, col_f] - cmd_np[:, col_f]).max(), tol_f)
     check("decode pwm", np.abs(cmd_c[:, col_i] - cmd_np[:, col_i]).max(), 1.001)
-    other = [i for i in range(CMD_FLOATS) if i not in range(*col_f.indices(CMD_FLOATS))
-             and i not in range(*col_i.indices(CMD_FLOATS))]
-    check("decode leaves the other kind's columns zero", np.abs(cmd_c[:, other]).max(), 0.5)
 
     # 5. end to end
     if snaps is not None:
@@ -462,12 +435,9 @@ def main():
         full_np = np.stack([
             np_decode(np.clip(np_forward(layers, C["activation"], obs_np[i].astype(np.float32),
                                          C["output_squash"]), -1, 1),
-                      VNOM, RPM_SCALE, float(snaps[i, 17]), C)
+                      VNOM, RPM_SCALE, C)
             for i in range(len(snaps))])
-        diff = full_c[:, col_f] - full_np[:, col_f]
-        if kind == KIND_MELLINGER:
-            diff[:, 2] = (diff[:, 2] + 180.0) % 360.0 - 180.0
-        check("end-to-end float channels", np.abs(diff).max(), tol_e2e)
+        check("end-to-end rpm", np.abs(full_c[:, col_f] - full_np[:, col_f]).max(), tol_e2e)
         check("end-to-end pwm", np.abs(full_c[:, col_i] - full_np[:, col_i]).max(), 2.001)
 
     # 6. optional: real-flight observations from the shadow's bag export

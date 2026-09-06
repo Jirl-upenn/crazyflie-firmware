@@ -29,6 +29,7 @@ const char* nnpolSlotStatusName(nnpolSlotStatus_t s)
     case NNPOL_SLOT_BAD_SIZE: return "bad size";
     case NNPOL_SLOT_BAD_DIMS: return "bad dims";
     case NNPOL_SLOT_BAD_CRC: return "bad crc";
+    case NNPOL_SLOT_BAD_KIND: return "not an rpm-family policy";
     default: return "?";
   }
 }
@@ -74,6 +75,11 @@ nnpolSlotStatus_t nnpolSlotValidate(const void* base, uint32_t capacityBytes)
   const uint8_t* bytes = (const uint8_t*)base;
   if (nnpolCrc32(bytes + 16, h->totalBytes - 16, 0) != h->crc32) {
     return NNPOL_SLOT_BAD_CRC;
+  }
+  if (h->actionKind != NNPOL_ACTION_KIND_MOTOR) {
+    /* onboard_only: the setpoint kinds and the inner controllers they need
+     * live on the nnpol branch; here the only action is a rotor speed. */
+    return NNPOL_SLOT_BAD_KIND;
   }
   return NNPOL_SLOT_OK;
 }

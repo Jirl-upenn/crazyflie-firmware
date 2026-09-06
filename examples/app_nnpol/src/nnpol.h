@@ -25,8 +25,8 @@
  *   - the action is [-1, 1]^4, clipped exactly as the sim clips it;
  *   - the run's yaw anchor (crazyflie-ros TrajLissajousBody.anchor): the
  *     engage heading yaw0 is the run's yaw zero. The curve is yawed by it
- *     about the engage point, the observed attitude is relative to it,
- *     and a commanded yaw ANGLE gets it added back (rates need nothing).
+ *     about the engage point and the observed attitude is relative to it
+ *     (rotor speeds are body-frame and need nothing).
  */
 #ifndef NNPOL_H
 #define NNPOL_H
@@ -66,30 +66,11 @@ typedef struct {
   nnpolRaceTrack_t race; /**< RACE_V3: the pinned track and the target gate */
 } nnpolSnapshot_t;
 
-/** One decoded command, every stage kept for logging and host parity.
- * Which fields mean anything depends on the slot's actionKind; the rest
- * are 0.
- *
- * ch[3] are the three non-thrust channels in the HOST's wire units and
- * sign — exactly what crazyflie-ros hands cflib's send_setpoint:
- *   MELLINGER  [roll, pitch, yaw] degrees (attitude_cmd_clbk,
- *              FIRMWARE_PITCH_SIGN = +1), the yaw already anchored back
- *              into the mocap frame (MellingerAttitudePolicy.decode)
- *   CTBR       [roll_rate, pitch_rate, yaw_rate] degrees/second
- *              (send_ctbr_policy_command; the driver's own yaw negation
- *              and the firmware's undo it, so the sign is the trainer's)
- * The controller then applies what the radio path applies between the
- * host and setpoint_t — cflib negates pitch on the wire — when it
- * synthesizes the setpoint, so onboard and radio flights agree. */
+/** One decoded command (onboard_only: the rpm family only), every stage
+ * kept for logging and host parity. */
 typedef struct {
-  float ch[3];
-  float thrustN;         /**< setpoint kinds: decoded collective, newtons */
-  float thrustPwm;       /**< setpoint kinds: 0..65535, the host's pre-clamp value */
-  float thrustSetpoint;  /**< setpoint kinds: what setpoint->thrust gets — the
-                              crtp_commander_rpyt clamp applied (0 below
-                              MIN_THRUST, capped at MAX_THRUST) */
-  float rpm[4];          /**< MOTOR: mixer output x rpmScale, M1..M4 */
-  float motorPwm[4];     /**< MOTOR: 0..65535 per motor, rounded as the host's
+  float rpm[4];          /**< mixer output x rpmScale, M1..M4 */
+  float motorPwm[4];     /**< 0..65535 per motor, rounded as the host's
                               rpm_to_pwm rounds (np.rint) */
 } nnpolCmd_t;
 
@@ -130,14 +111,12 @@ int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
  * -> act[4], the RAW (unsquashed) mean — the caller clips to [-1, 1]. */
 void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTION_DIM]);
 
-/** Clipped action in [-1, 1]^4 -> command, along the header's decode
- * path. `vnom` is the battery voltage every thrust/rpm-to-PWM map assumes
- * (nnpol.vnom, pushed at engage — the same fixed voltage the host uses,
- * for shadow parity); `rpmScale` is the MOTOR kind's hover-point
- * calibration knob (nnpol.rpmScale, the host's motor_pwm.rpm_scale);
- * `yaw0` is the run's yaw anchor, added back to a MELLINGER yaw command.
- * Each is ignored by the kinds it does not concern. */
+/** Clipped action in [-1, 1]^4 -> per-motor rotor speed and PWM, through
+ * the header's mixer. `vnom` is the battery voltage the rpm-to-PWM map
+ * assumes (nnpol.vnom, pushed at engage — the same fixed voltage the host
+ * uses, for shadow parity); `rpmScale` is the hover-point calibration knob
+ * (nnpol.rpmScale, the host's motor_pwm.rpm_scale). */
 void nnpolDecodeAction(const nnpolSlotHeader_t* hdr, const float action[NNPOL_ACTION_DIM],
-                       float vnom, float rpmScale, float yaw0, nnpolCmd_t* out);
+                       float vnom, float rpmScale, nnpolCmd_t* out);
 
 #endif /* NNPOL_H */

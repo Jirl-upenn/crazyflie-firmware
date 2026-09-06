@@ -12,16 +12,13 @@
  * buffer. The controller applies the latest complete action as a
  * zero-order hold — the same hold the sim's 5 substeps per action
  * perform — by synthesizing the setpoint_t the same command would have
- * produced ARRIVING BY RADIO and handing it to the inner controller the
- * slot's action kind needs:
+ * produced ARRIVING BY RADIO — on this branch always the per-motor shape:
  *
- *   MELLINGER  attitude-only setpoint -> controllerMellingerFirmware, the
- *              exact inner loop the offboard Mellinger flights validated
- *   CTBR       legacy RATE-mode setpoint -> controllerPid, the loop the
- *              SE3 takeoff/land cascade and the offboard ctbr policy fly on
  *   MOTOR      modeMotorPwm setpoint (thrust = M1, attitudeRate = M2..M4)
- *              -> controllerPid's per-motor bypass (the generic commander
- *              type-12 path), no onboard loop at all
+ *              -> controllerPid's per-motor bypass, no onboard loop at all.
+ *              onboard_only flies the rpm family only; a slot of another
+ *              kind fails validation (nnpolSlotValidate) and is never
+ *              selected. The Mellinger and the rate loop live on nnpol.
  *
  * The passthrough (nnpol.enable = 0, no usable slot, or a stale action)
  * is the stock PID: the only thing the ground station ever streams on
@@ -40,13 +37,6 @@
  * obsDim / actDim / kind / ctrlHz params, which the ground station's
  * existing hash check verifies before engaging. Erase and select run in
  * the app task, only while nothing is engaged.
- *
- * Radio-path equivalence, including the wire: cflib's send_setpoint packs
- * -pitch, and crtp_commander_rpyt.c copies values->pitch into the
- * setpoint unchanged, so the setpoint_t a host command produces carries
- * the NEGATED host pitch (angle or rate). The synthesized setpoint does
- * the same. Bench-check nnpol.spPitch against a /attitude_cmd pitch step
- * before the first onboard flight.
  *
  * Engage protocol (the ground station's side is crazyflie-ros
  * `exec: onboard`): select the slot, verify nnpol.hash0-3 against the run
@@ -81,7 +71,6 @@
 #include "debug.h"
 
 #include "controller.h"
-#include "controller_mellinger.h"
 #include "controller_pid.h"
 #include "log.h"
 #include "motors.h"
@@ -174,12 +163,11 @@ static uint16_t paramTaskId = 0xFFFF;
 
 // --------------------------------------------------------------------------
 // The selected policy (owned by the app task; read by the stabilizer only
-// through activeValid + activeKind, which change only while disengaged)
+// through activeValid, which changes only while disengaged)
 // --------------------------------------------------------------------------
 
 static nnpolPolicy_t activePolicy = { NULL, NULL };
 static volatile bool activeValid = false;
-static volatile uint16_t activeKind = 0xFFFF;
 
 static void publishIdentity(const nnpolSlotHeader_t* h)
 {
@@ -203,7 +191,6 @@ static void publishIdentity(const nnpolSlotHeader_t* h)
 static void selectSlot(uint8_t slot)
 {
   activeValid = false;
-  activeKind = 0xFFFF;
   activePolicy.hdr = NULL;
   activePolicy.weights = NULL;
   if (slot == NNPOL_SLOT_NONE || slot >= NNPOL_NUM_SLOTS) {
@@ -235,7 +222,6 @@ static void selectSlot(uint8_t slot)
                 slot, h->taskId, h->obsDim);
   }
   publishIdentity(h);
-  activeKind = h->actionKind;
   activeValid = true;
   paramSlotSel = slot;
   paramSlotState = SLOT_STATE_SELECTED;
@@ -317,8 +303,7 @@ static uint32_t actionRead(nnpolCmd_t* out)
 
 static float logT;
 static float logAct[NNPOL_ACTION_DIM];      /* clipped network output */
-static float logSpRoll, logSpPitch, logSpYaw, logSpThrust;
-static uint16_t logPwm[4];                  /* MOTOR kind: per-motor PWM */
+static uint16_t logPwm[4];                  /* the decoded per-motor PWM */
 static float logVb[3], logWb[3], logE0[3];  /* obs excerpts */
 static uint16_t logUs;                      /* inference microseconds */
 static uint16_t logStale;                   /* periods spent >= stale threshold */
@@ -332,7 +317,7 @@ static uint32_t logSeq;
 static TaskHandle_t appTaskHandle = NULL;
 
 /** Erase / select requests from the params. Only while disengaged: the
- * stabilizer reads activeValid/activeKind and the bank refuses writes
+ * stabilizer reads activeValid and the bank refuses writes
  * while locked, so nothing changes under a flying policy. */
 static void housekeeping(void)
 {
@@ -398,7 +383,7 @@ void appMain()
     }
 
     nnpolCmd_t cmd;
-    nnpolDecodeAction(activePolicy.hdr, act, paramVnom, activeRpmScale, activeYaw0, &cmd);
+    nnpolDecodeAction(activePolicy.hdr, act, paramVnom, activeRpmScale, &cmd);
 
     const uint64_t elapsed = usecTimestamp() - tStart;
 
@@ -408,10 +393,6 @@ void appMain()
      * framework whenever a block samples them. */
     logT = snap.t;
     memcpy(logAct, act, sizeof(logAct));
-    logSpRoll = cmd.ch[0];
-    logSpPitch = cmd.ch[1];
-    logSpYaw = cmd.ch[2];
-    logSpThrust = cmd.thrustSetpoint;
     for (int i = 0; i < 4; i++) {
       logPwm[i] = (uint16_t)cmd.motorPwm[i];
     }
@@ -450,7 +431,6 @@ static uint32_t tickDividerFor(uint16_t hz)
 void controllerOutOfTreeInit()
 {
   nnpolSlotBankInit();   /* here, not in appMain: see nnpol_slot_bank.h */
-  controllerMellingerFirmwareInit();
   controllerPidInit();
   wasEnabled = false;
   periodsWithoutFresh = 0;
@@ -458,12 +438,11 @@ void controllerOutOfTreeInit()
 
 bool controllerOutOfTreeTest()
 {
-  return controllerMellingerFirmwareTest() && controllerPidTest();
+  return controllerPidTest();
 }
 
 /** The inner loop a radio setpoint gets: the stock PID, as
- * stabilizer.controller = 1 would run it. The Mellinger is reached only
- * by an engaged MELLINGER-kind slot, never by the radio. */
+ * stabilizer.controller = 1 would run it. */
 static void passthrough(control_t* control, const setpoint_t* setpoint,
                         const sensorData_t* sensors, const state_t* state,
                         const uint32_t tick)
@@ -592,12 +571,9 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
   }
 
   /* Zero-order hold of the latest complete action, in the exact setpoint
-   * shape the radio path produces for this kind. cmd.ch[] is in the host's
-   * wire units and sign; cflib packs -pitch, and crtp_commander_rpyt copies
-   * values->pitch into the setpoint unchanged, so the setpoint gets the
-   * negated host pitch. Roll and yaw arrive unchanged (the driver's
-   * yaw-rate negation and the decoder's "legacy rate input is inverted"
-   * cancel). */
+   * shape the (former) per-motor radio packet produced: modeMotorPwm on
+   * all three axes, M1 in thrust and M2..M4 in attitudeRate, which
+   * controllerPid turns into normalized forces and nothing else. */
   setpoint_t sp;
   memset(&sp, 0, sizeof(sp));
   sp.timestamp = setpoint->timestamp;
@@ -605,45 +581,14 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
   sp.mode.y = modeDisable;
   sp.mode.z = modeDisable;
   sp.mode.quat = modeDisable;
-  switch (activeKind) {
-    case NNPOL_ACTION_KIND_MELLINGER:
-      /* crtp_commander_rpyt ANGLE branch: roll/pitch/yaw modeAbs, thrust
-       * already through the legacy clamp. */
-      sp.mode.roll = modeAbs;
-      sp.mode.pitch = modeAbs;
-      sp.mode.yaw = modeAbs;
-      sp.attitude.roll = cmd.ch[0];
-      sp.attitude.pitch = -cmd.ch[1];
-      sp.attitude.yaw = cmd.ch[2];
-      sp.thrust = cmd.thrustSetpoint;
-      controllerMellingerFirmware(control, &sp, sensors, state, tick);
-      break;
-    case NNPOL_ACTION_KIND_CTBR:
-      /* crtp_commander_rpyt RATE branch: roll/pitch/yaw modeVelocity with
-       * the rates in attitudeRate (deg/s), attitude zeroed. */
-      sp.mode.roll = modeVelocity;
-      sp.mode.pitch = modeVelocity;
-      sp.mode.yaw = modeVelocity;
-      sp.attitudeRate.roll = cmd.ch[0];
-      sp.attitudeRate.pitch = -cmd.ch[1];
-      sp.attitudeRate.yaw = cmd.ch[2];
-      sp.thrust = cmd.thrustSetpoint;
-      controllerPid(control, &sp, sensors, state, tick);
-      break;
-    default:
-      /* crtp_commander_generic motorPwmDecoder (type 12): modeMotorPwm on
-       * all three axes, M1 in thrust and M2..M4 in attitudeRate, which
-       * controllerPid turns into normalized forces and nothing else. */
-      sp.mode.roll = modeMotorPwm;
-      sp.mode.pitch = modeMotorPwm;
-      sp.mode.yaw = modeMotorPwm;
-      sp.thrust = cmd.motorPwm[0];
-      sp.attitudeRate.roll = cmd.motorPwm[1];
-      sp.attitudeRate.pitch = cmd.motorPwm[2];
-      sp.attitudeRate.yaw = cmd.motorPwm[3];
-      controllerPid(control, &sp, sensors, state, tick);
-      break;
-  }
+  sp.mode.roll = modeMotorPwm;
+  sp.mode.pitch = modeMotorPwm;
+  sp.mode.yaw = modeMotorPwm;
+  sp.thrust = cmd.motorPwm[0];
+  sp.attitudeRate.roll = cmd.motorPwm[1];
+  sp.attitudeRate.pitch = cmd.motorPwm[2];
+  sp.attitudeRate.yaw = cmd.motorPwm[3];
+  controllerPid(control, &sp, sensors, state, tick);
 }
 
 // --------------------------------------------------------------------------
@@ -742,7 +687,7 @@ PARAM_ADD(PARAM_FLOAT, g7ny, &paramGates[7][4])
 PARAM_ADD(PARAM_FLOAT, g7nz, &paramGates[7][5])
 /** @brief Battery voltage every thrust/rpm-to-PWM map assumes (host parity). */
 PARAM_ADD(PARAM_FLOAT, vnom, &paramVnom)
-/** @brief MOTOR kind: rpm multiplier before the PWM map (host motor_pwm.rpm_scale). */
+/** @brief rpm multiplier before the PWM map (host motor_pwm.rpm_scale). */
 PARAM_ADD(PARAM_FLOAT, rpmScale, &paramRpmScale)
 /** @brief Policy rate (Hz) latched at the enable rising edge. Defaults to
  * the selected slot's trained ctrl_freq; must divide 1000 to run exactly. */
@@ -778,7 +723,7 @@ PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, hash2, &paramHash2)
 PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, hash3, &paramHash3)
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, obsDim, &paramObsDim)
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, actDim, &paramActDim)
-/** @brief Decode path of the selected slot: 0 Mellinger, 1 ctbr, 2 motor. */
+/** @brief Decode path of the selected slot: always 2 (motor) on this branch. */
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, kind, &paramKind)
 /** @brief Observation builder of the selected slot (0 lissajous/body). */
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, taskId, &paramTaskId)
@@ -796,13 +741,7 @@ LOG_ADD(LOG_FLOAT, act0, &logAct[0])
 LOG_ADD(LOG_FLOAT, act1, &logAct[1])
 LOG_ADD(LOG_FLOAT, act2, &logAct[2])
 LOG_ADD(LOG_FLOAT, act3, &logAct[3])
-/** @brief Decoded setpoint in the host's wire units: MELLINGER angles
- * (deg), CTBR rates (deg/s), plus the legacy thrust; zero for MOTOR. */
-LOG_ADD(LOG_FLOAT, spRoll, &logSpRoll)
-LOG_ADD(LOG_FLOAT, spPitch, &logSpPitch)
-LOG_ADD(LOG_FLOAT, spYaw, &logSpYaw)
-LOG_ADD(LOG_FLOAT, spThrust, &logSpThrust)
-/** @brief MOTOR kind: per-motor PWM M1..M4 (zero for the setpoint kinds). */
+/** @brief The decoded per-motor PWM M1..M4. */
 LOG_ADD(LOG_UINT16, pwm0, &logPwm[0])
 LOG_ADD(LOG_UINT16, pwm1, &logPwm[1])
 LOG_ADD(LOG_UINT16, pwm2, &logPwm[2])

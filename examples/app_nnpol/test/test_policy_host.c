@@ -16,17 +16,16 @@
  *   info   : prints "status obsDim actionDim numLayers kind mixer taskId ctrlHz"
  *   policy : obs[obsDim]                          -> act[4]   (raw, unclipped)
  *   obs    : snapshot[85]                         -> obs[obsDim]
- *   act    : action[4], vnom, rpmScale, yaw0      -> cmd[14]
- *   full   : snapshot[85], vnom, rpmScale         -> cmd[14]  (obs -> net -> clip -> decode)
+ *   act    : action[4], vnom, rpmScale            -> cmd[8]
+ *   full   : snapshot[85], vnom, rpmScale         -> cmd[8]   (obs -> net -> clip -> decode)
  *   gate   : pos(3), gateSide, gateIdx, prevGateX, nGates, gates(8x3), normals(8x3)
  *                                                 -> [gateIdx, prevGateX] (one crossing-test step)
  *
  * snapshot[85] = [t, off(3), pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), yaw0,
  *                 curve(13: amp3 omega3 phase3 center3 yaw), rpm_norm(4),
  *                 race: nGates, gateIdx, gates(8 x 3), normals(8 x 3)]
- * cmd[14]      = [ch0, ch1, ch2, thrustN, thrustPwm, thrustSetpoint,
- *                 rpm(4), motorPwm(4)]   — nnpolCmd_t flattened; which
- *                 columns are non-zero depends on the slot's actionKind
+ * cmd[8]       = [rpm(4), motorPwm(4)]   — nnpolCmd_t flattened (onboard_only:
+ *                 the rpm family only)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,8 +34,8 @@
 #include "nnpol.h"
 
 #define SNAP_FLOATS 85
-#define CMD_FLOATS 14
-#define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 3)
+#define CMD_FLOATS 8
+#define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 2)
 #define SLOT_CAPACITY 0x20000u
 
 static uint8_t g_slot[SLOT_CAPACITY];
@@ -62,14 +61,8 @@ static void unpackSnapshot(const float* in, nnpolSnapshot_t* s)
 
 static void packCmd(const nnpolCmd_t* c, float* out)
 {
-  out[0] = c->ch[0];
-  out[1] = c->ch[1];
-  out[2] = c->ch[2];
-  out[3] = c->thrustN;
-  out[4] = c->thrustPwm;
-  out[5] = c->thrustSetpoint;
-  memcpy(out + 6, c->rpm, 4 * sizeof(float));
-  memcpy(out + 10, c->motorPwm, 4 * sizeof(float));
+  memcpy(out, c->rpm, 4 * sizeof(float));
+  memcpy(out + 4, c->motorPwm, 4 * sizeof(float));
 }
 
 static void clipAction(float* act)
@@ -157,8 +150,7 @@ int main(int argc, char** argv)
     float in[ACT_IN_FLOATS], out[CMD_FLOATS];
     nnpolCmd_t cmd;
     while (fread(in, sizeof(float), ACT_IN_FLOATS, stdin) == ACT_IN_FLOATS) {
-      nnpolDecodeAction(hdr, in, in[NNPOL_ACTION_DIM], in[NNPOL_ACTION_DIM + 1],
-                        in[NNPOL_ACTION_DIM + 2], &cmd);
+      nnpolDecodeAction(hdr, in, in[NNPOL_ACTION_DIM], in[NNPOL_ACTION_DIM + 1], &cmd);
       packCmd(&cmd, out);
       fwrite(out, sizeof(float), CMD_FLOATS, stdout);
     }
@@ -173,7 +165,7 @@ int main(int argc, char** argv)
       }
       nnpolForward(&policy, obs, act);
       clipAction(act);
-      nnpolDecodeAction(hdr, act, in[SNAP_FLOATS], in[SNAP_FLOATS + 1], snap.yaw0, &cmd);
+      nnpolDecodeAction(hdr, act, in[SNAP_FLOATS], in[SNAP_FLOATS + 1], &cmd);
       packCmd(&cmd, out);
       fwrite(out, sizeof(float), CMD_FLOATS, stdout);
     }

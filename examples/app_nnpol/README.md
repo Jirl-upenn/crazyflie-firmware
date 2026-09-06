@@ -7,8 +7,14 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 
 ## What it does
 
-- **This is the `onboard_only` branch**: there is no offboard policy
-  route. The ground station streams one thing, the SE3 cascade's rate
+- **This is the `onboard_only` branch: onboard rpm control only.** The
+  app flies rpm-family slots (`attitude`, `rpm`, `rpm_direct`): the network
+  commands per-motor rotor speeds, the app mixes them, maps them to PWM and
+  applies them through the PID's per-motor bypass — no onboard controller
+  runs while engaged. A slot of another kind fails validation
+  (`nnpol.slotStatus` 6); the Mellinger and ctbr paths and the inner
+  controllers they need live on the `nnpol` branch. There is no offboard
+  policy route. The ground station streams one thing, the SE3 cascade's rate
   setpoint on `/ctbr_cmd` (takeoff, hover, landing, and the hold-here
   keepalive during a race), and the network only ever runs here, from a
   flash slot. The host-side per-motor packet (type 12) is removed from
@@ -16,8 +22,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 - `CONFIG_CONTROLLER_OOT` registers this app as `stabilizer.controller = 6`.
   With `nnpol.enable = 0` (default) the radio setpoint passes straight
   through to the stock PID, so behaviour is identical to
-  `stabilizer.controller = 1`, which is validation step 1. The firmware
-  Mellinger is reached only by an engaged Mellinger-kind slot. The driver's
+  `stabilizer.controller = 1`, which is validation step 1. The driver's
   `onboard_controller: oot` is controller 6 with the legacy packet read as
   rates.
 - **The app is checkpoint-agnostic: build and flash it once.** Policies
@@ -37,13 +42,11 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
   engaging) the controller snapshots the EKF state + gyro and notifies the
   app task, which builds the observation, runs the network through the
   interpreter (`nnpol_policy.c`, weights read straight from the flash
-  slot — no RAM), decodes the action along the slot's kind (attitude,
-  body rates, or per-motor PWM) and publishes it into a sequence-locked
+  slot — no RAM), decodes the action through the slot's mixer into four
+  rotor speeds and their PWM and publishes it into a sequence-locked
   buffer. The controller applies the newest complete action as a
-  zero-order hold, synthesizing the `setpoint_t` the same command would
-  have produced arriving by radio — INCLUDING cflib's pitch negation on
-  the wire (the phase-1 decoder missed it; bench-check `nnpol.spPitch`
-  against a `/attitude_cmd` pitch step before the first onboard flight).
+  zero-order hold, synthesizing the per-motor `setpoint_t`
+  (`modeMotorPwm`) that `controllerPid` turns straight into motor ratios.
   Inference never runs in the 1 kHz stabilizer context.
 - The host keeps streaming its command topic as the commander-watchdog
   keepalive and shadow reference; clearing `nnpol.enable` mid-flight is an
@@ -76,7 +79,7 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 | `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh, output map from the header (clip for PPO, tanh for SAC / BPTT / TD3) (pure C) |
 | `src/nnpol_obs_lissajous.c` | the Lissajous-family body observations: the fixed eight or a pushed per-run curve (traj_easy), with the yaw anchor and the optional rotor-speed tail (pure C) |
 | `src/nnpol_obs_race.c` | the race v3 observation on the pushed pinned track, and the gate-crossing test (pure C) |
-| `src/nnpol_action.c` | action decode for all three kinds from the header's constants (pure C) |
+| `src/nnpol_action.c` | the rpm family's decode: the header's mixer, rpm_scale, rpm-to-PWM (pure C) |
 | `test/` | host parity harness (plain gcc) + python runner, driven by a run directory's `policy_slot.bin` |
 
 ## Slot protocol (what the ROS driver does)
@@ -133,9 +136,8 @@ read-only: `slotSel`, `slotState`, `slotStatus`, `slotValid`, `nSlots`,
 `writeSlot`, `writtenBytes`, `runHz`, and the selected slot's identity
 `hash0-3`, `obsDim`, `actDim`, `kind`, `taskId`.
 
-Logs (`nnpol.`): `t`, `act0-3` (clipped network output), `spRoll/Pitch/
-Yaw/Thrust` (decoded setpoint in the host's wire units: deg or deg/s, +
-legacy thrust), `pwm0-3` (MOTOR kind's per-motor PWM), `vbx/y/z`,
+Logs (`nnpol.`): `t`, `act0-3` (clipped network output), `pwm0-3` (the
+decoded per-motor PWM), `vbx/y/z`,
 `wbx/y/z`, `e0x/y/z` (observation excerpts), `us` (inference time),
 `stale`, `obsErr`, `gateIdx`, `seq`.
 
