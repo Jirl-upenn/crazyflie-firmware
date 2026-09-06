@@ -117,6 +117,7 @@ typedef enum {
   NNPOL_SLOT_BAD_SIZE = 3,   /* header/total bytes inconsistent or > capacity */
   NNPOL_SLOT_BAD_DIMS = 4,   /* outside the interpreter's limits */
   NNPOL_SLOT_BAD_CRC = 5,
+  NNPOL_SLOT_BAD_KIND = 6,   /* onboard_only: not an rpm-family (MOTOR) policy */
 } nnpolSlotStatus_t;
 
 /** zlib/binascii-compatible CRC-32 (reflected 0xEDB88320, init/xor
@@ -126,7 +127,9 @@ uint32_t nnpolCrc32(const uint8_t* data, uint32_t len, uint32_t seed);
 
 /** Check a candidate blob (flash slot or file image) of at most
  * `capacityBytes`: magic, sizes, dims against the interpreter limits,
- * layer bookkeeping (payloadFloats == sum of kernel + bias sizes), CRC. */
+ * layer bookkeeping (payloadFloats == sum of kernel + bias sizes), CRC,
+ * and — on this branch — that the decode path is the rpm family: the
+ * exporter still writes every kind, the app flies MOTOR slots only. */
 nnpolSlotStatus_t nnpolSlotValidate(const void* base, uint32_t capacityBytes);
 
 /** The weights of a validated blob. */
