@@ -23,11 +23,14 @@
  *              -> controllerPid's per-motor bypass (the generic commander
  *              type-12 path), no onboard loop at all
  *
- * The passthrough (nnpol.enable = 0, or no usable slot) dispatches on the
- * radio setpoint's own shape — an ANGLE setpoint (mode.roll == modeAbs)
- * to the Mellinger, everything else to the PID — so the shadow stream on
- * /attitude_cmd, /ctbr_cmd or /motor_cmd flies through controller 6
- * exactly as it does through 2 or 1. Expected added latency: one 1 kHz
+ * The passthrough (nnpol.enable = 0, no usable slot, or a stale action)
+ * is the stock PID: the only thing the ground station ever streams on
+ * this branch is the SE3 cascade's RATE setpoint on /ctbr_cmd — takeoff,
+ * hover, landing, and during a race the hold-here keepalive the vehicle
+ * falls back to on takeover. There is no offboard policy route: no
+ * attitude stream, no per-motor packet (the type-12 decoder is gone from
+ * crtp_commander_generic.c on this branch), so controller 6 flies the
+ * radio exactly as controller 1 does. Expected added latency: one 1 kHz
  * tick.
  *
  * THE APP IS CHECKPOINT-AGNOSTIC. Policies live in the flash slot bank
@@ -457,18 +460,14 @@ bool controllerOutOfTreeTest()
   return controllerMellingerFirmwareTest() && controllerPidTest();
 }
 
-/** The inner loop a radio setpoint needs: the ANGLE shape the driver's
- * 'oot' mode produces goes to the Mellinger (as stabilizer.controller = 2
- * would), the RATE and per-motor shapes of 'oot_rate' to the PID (as 1). */
+/** The inner loop a radio setpoint gets: the stock PID, as
+ * stabilizer.controller = 1 would run it. The Mellinger is reached only
+ * by an engaged MELLINGER-kind slot, never by the radio. */
 static void passthrough(control_t* control, const setpoint_t* setpoint,
                         const sensorData_t* sensors, const state_t* state,
                         const uint32_t tick)
 {
-  if (setpoint->mode.roll == modeAbs) {
-    controllerMellingerFirmware(control, setpoint, sensors, state, tick);
-  } else {
-    controllerPid(control, setpoint, sensors, state, tick);
-  }
+  controllerPid(control, setpoint, sensors, state, tick);
 }
 
 void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,

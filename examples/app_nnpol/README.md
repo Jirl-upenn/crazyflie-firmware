@@ -7,12 +7,19 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 
 ## What it does
 
+- **This is the `onboard_only` branch**: there is no offboard policy
+  route. The ground station streams one thing, the SE3 cascade's rate
+  setpoint on `/ctbr_cmd` (takeoff, hover, landing, and the hold-here
+  keepalive during a race), and the network only ever runs here, from a
+  flash slot. The host-side per-motor packet (type 12) is removed from
+  `crtp_commander_generic.c`.
 - `CONFIG_CONTROLLER_OOT` registers this app as `stabilizer.controller = 6`.
   With `nnpol.enable = 0` (default) the radio setpoint passes straight
-  through to the inner controller its shape asks for — an ANGLE setpoint
-  (the driver's `oot` mode) to the firmware Mellinger, a RATE or per-motor
-  setpoint (`oot_rate`) to the stock PID — so behaviour is identical to
-  `stabilizer.controller = 2` or `1`, which is validation step 1.
+  through to the stock PID, so behaviour is identical to
+  `stabilizer.controller = 1`, which is validation step 1. The firmware
+  Mellinger is reached only by an engaged Mellinger-kind slot. The driver's
+  `onboard_controller: oot` is controller 6 with the legacy packet read as
+  rates.
 - **The app is checkpoint-agnostic: build and flash it once.** Policies
   are `policy_slot.bin` blobs written by `mjc_dronetests/export_policy_c.py`
   (a 256-byte header — identity hash, dims, activation, decode kind, action
