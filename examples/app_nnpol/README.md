@@ -48,6 +48,14 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
   zero-order hold, synthesizing the per-motor `setpoint_t`
   (`modeMotorPwm`) that `controllerPid` turns straight into motor ratios.
   Inference never runs in the 1 kHz stabilizer context.
+- The build sets `CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE=500` (app-config):
+  the Kalman dynamics prediction runs at 500 Hz instead of upstream's
+  100 Hz, so the position and velocity the policy observes are at most
+  2 ms behind the IMU rather than 10 ms. Measurement updates and the
+  externalized state already ran at 1 kHz. Costs about five times the
+  prediction step's CPU; watch for `Kalman prediction rate off` and
+  stabilizer rate warnings on the console. The downlink cannot follow:
+  cflib log periods are 10 ms multiples, so `/ekf_state` stays at 100 Hz.
 - The host keeps streaming its command topic as the commander-watchdog
   keepalive and shadow reference; clearing `nnpol.enable` mid-flight is an
   instantaneous, format-compatible takeover by that stream.

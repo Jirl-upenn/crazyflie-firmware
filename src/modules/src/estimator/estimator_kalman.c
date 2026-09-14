@@ -116,7 +116,18 @@ static StaticSemaphore_t dataMutexBuffer;
 /**
  * Tuning parameters
  */
-#define PREDICT_RATE RATE_100_HZ // this is slower than the IMU update rate of 1000Hz
+// Prediction rate: CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE (Kconfig, upstream
+// default 100 - slower than the IMU update rate of 1000Hz). Only the dynamics
+// propagation is throttled by it; measurement updates, finalization and the
+// externalized state run every tick. The interval has to be a whole number
+// of 1 ms ticks, so the rate must divide 1000.
+#ifdef CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE
+#define PREDICT_RATE CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE
+#else
+#define PREDICT_RATE RATE_100_HZ
+#endif
+_Static_assert(PREDICT_RATE >= 1 && PREDICT_RATE <= RATE_1000_HZ && (1000 % PREDICT_RATE) == 0,
+               "CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE must divide 1000 (e.g. 100, 250, 500)");
 const uint32_t PREDICTION_UPDATE_INTERVAL_MS = 1000 / PREDICT_RATE;
 
 // The bounds on the covariance, these shouldn't be hit, but sometimes are... why?

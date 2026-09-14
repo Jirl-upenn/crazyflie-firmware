@@ -84,6 +84,24 @@ config ESTIMATOR_KALMAN_INITIAL_YAW_STD
         The initial yaw standard deviation describes how uncertain the Kalman estimator assumes the yaw angle is at startup.
         Note that the entered value is in milliradians (mrad).
 
+config ESTIMATOR_KALMAN_PREDICT_RATE
+    int "Kalman prediction (dynamics propagation) rate in Hz"
+    default 100
+    range 100 1000
+    depends on ESTIMATOR_KALMAN_ENABLE
+    help
+        How often the Kalman estimator propagates its state through the
+        dynamics with the sub-sampled IMU. Everything else in the estimator
+        (measurement updates, finalization, the state the controllers read)
+        already runs every 1 kHz stabilizer tick; only this step is
+        throttled, because it is the expensive one (9-state covariance
+        propagation). Upstream default 100. Between predictions the
+        externalized position and velocity sit on the last one, so at
+        100 Hz they can be up to 10 ms stale when a controller samples them;
+        500 Hz brings that to 2 ms at roughly five times the estimator's
+        prediction cost. Must divide 1000 (100, 125, 200, 250, 500, 1000):
+        the task clock is the 1 ms tick.
+
 config ESTIMATOR_UKF_ENABLE
     bool "Enable error-state UKF estimator"
     select ESTIMATOR_OUTLIER_FILTERS

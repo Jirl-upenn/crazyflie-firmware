@@ -6,3 +6,9 @@ CONFIG_APP_PRIORITY=1
 # overflows; 1000 words = 4 KB leaves ~2.5x headroom.
 CONFIG_APP_STACKSIZE=1000
 CONFIG_CONTROLLER_OOT=y
+# Kalman prediction at 500 Hz (upstream 100): the externalized position and
+# velocity the policy observes are then at most 2 ms behind the IMU instead
+# of 10 ms. Everything else in the estimator already runs at 1 kHz. Costs
+# ~5x the prediction step's CPU; check stabilizer rate warnings on the
+# console after flashing. See CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE.
+CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE=500
