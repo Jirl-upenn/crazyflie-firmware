@@ -22,6 +22,36 @@ matching tag on `ros_quad_sim2real`.
 | tag | phase | what to do | go |
 |---|---|---|---|
 | `orpm-p0-baseline` | host tests, and nothing changed in the air | `python3 test/run_host_parity.py`; build; flash; take off, hover and land on the SE3 cascade | parity passes; image ends below sector 7; hover as before |
+| `orpm-p1-mocap-bench` | mocap bench, props off (ROS `orpm-p1-mocap-bench`) | `python -m pytest test_python/test_pose_delay.py`; flash; stream mocap; log `kalman.poseAgeMs`, `poseHostMs`, `poseDrop` | applied age appears and tracks the driver's value; no drops at rest; no "Kalman prediction rate off" on the console |
+| (same commit) | hover, compensation off then on | hover on the SE3 cascade with `kalman.poseComp` 0, then 1 (driver config `pose_delay_comp`) | no change in hover position or heading error between the two; no rate warnings |
+| (same commit) | latency flight (ROS `orpm-p3-latency-flight`) | straight passes at stepped speeds, compensation off then on; run the ROS calibration script on both bags | the off bag gives a stable `d0`; with `kalman.poseD0Ms` set, the on bag's slope is within 2 ms of zero (target) |
+
+## Mocap latency compensation
+
+The stock pose update compares a mocap pose with the estimator's CURRENT
+state, so a moving vehicle's estimate trails by speed × latency. On this
+branch:
+
+- The ground station sends `EXT_POSE_AGED` (localization port, generic
+  channel, type 32): `<fffIH` = x, y, z in metres, the compressed quaternion
+  of the packed pose, and how long it held the sample before the radio, in
+  units of 0.1 ms. The stock pose packets still work and behave as before.
+- The estimator keeps 64 ms of position and attitude history
+  (`kalman_core/pose_history.c`) and, with `kalman.poseComp = 1`, forms the
+  residual against the state it held when the pose was captured, applies it
+  to the current state, and carries the correction into the history
+  (`kalmanCoreUpdateWithPoseDelayed`).
+- The age it uses is: the packet's age + the time the packet waited on the
+  vehicle (measured) + `kalman.poseD0Ms`, the fixed part nobody can time
+  (mocap capture latency, radio hop), calibrated once from a flight.
+- A pose older than the history is dropped and counted (`kalman.poseDrop`).
+  An age of zero is the stock update bit for bit.
+- Built with `CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP` (on in `app-config`);
+  `kalman.poseComp` defaults to 0, so a freshly flashed vehicle behaves as
+  stock until the ground station turns it on.
+
+Logs (`kalman.`): `poseAgeMs` (total age applied), `poseHostMs` (the
+packet's part), `poseDrop`, `poseResX/Y/Z` (position residual as applied).
 
 ## What it does
 

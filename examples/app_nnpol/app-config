@@ -12,3 +12,7 @@ CONFIG_CONTROLLER_OOT=y
 # ~5x the prediction step's CPU; check stabilizer rate warnings on the
 # console after flashing. See CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE.
 CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE=500
+# The external pose is corrected against the state the estimator held when
+# the pose was captured (EXT_POSE_AGED, kalman.poseComp / poseD0Ms): without
+# it the position the policy observes lags by speed x mocap latency.
+CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP=y

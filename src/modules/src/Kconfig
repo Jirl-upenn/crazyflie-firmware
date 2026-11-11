@@ -102,6 +102,23 @@ config ESTIMATOR_KALMAN_PREDICT_RATE
         prediction cost. Must divide 1000 (100, 125, 200, 250, 500, 1000):
         the task clock is the 1 ms tick.
 
+config ESTIMATOR_KALMAN_POSE_DELAY_COMP
+    bool "Delay-compensated external pose update"
+    default n
+    depends on ESTIMATOR_KALMAN_ENABLE
+    help
+        Correct an aged external pose (the EXT_POSE_AGED localization packet,
+        which carries how old the sample is) against the state the estimator
+        held when the pose was captured, instead of against the current
+        state. Without this the estimate lags a moving vehicle by about
+        speed times latency: 15 cm at 10 m/s with 15 ms of mocap latency.
+
+        Keeps 64 ms of position and attitude history (about 2 KB of RAM).
+        Adds the kalman.poseComp (runtime switch, default off) and
+        kalman.poseD0Ms (fixed latency offset) parameters and the
+        kalman.poseAgeMs / poseHostMs / poseDrop / poseRes* log variables.
+        The stock pose packets are unaffected.
+
 config ESTIMATOR_UKF_ENABLE
     bool "Enable error-state UKF estimator"
     select ESTIMATOR_OUTLIER_FILTERS

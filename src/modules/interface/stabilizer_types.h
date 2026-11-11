@@ -141,6 +141,11 @@ typedef struct poseMeasurement_s {
   quaternion_t quat;
   float stdDevPos;
   float stdDevQuat;
+  // Age of the pose, for the aged external pose packet (EXT_POSE_AGED); all
+  // zero for every other source, which is then treated as current.
+  uint32_t rxTimeUs;   // usecTimestamp() (wrapping) when the packet was decoded
+  uint16_t hostAge;    // age the sender measured before sending, units of 0.1 ms
+  uint8_t aged;        // 1 = rxTimeUs and hostAge are valid
 } poseMeasurement_t;
 
 typedef struct distanceMeasurement_s {

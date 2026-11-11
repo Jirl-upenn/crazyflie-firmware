@@ -53,6 +53,7 @@
 #include "peer_localization.h"
 
 #include "num.h"
+#include "usec_time.h"
 
 
 #define NBR_OF_RANGES_IN_PACKET   5
@@ -225,6 +226,41 @@ static void extPoseHandler(const CRTPPacket* pk) {
   ext_pose.quat.w = data->qw;
   ext_pose.stdDevPos = extPosStdDev;
   ext_pose.stdDevQuat = extQuatStdDev;
+  ext_pose.aged = 0;
+
+  estimatorEnqueuePose(&ext_pose);
+  tickOfLastPacket = xTaskGetTickCount();
+}
+
+// The external pose with its age: float position, the compressed quaternion
+// of the packed pose, and how long the sender held the sample before handing
+// it to the radio, in units of 0.1 ms. The estimator adds the time the packet
+// then waits here and a calibrated fixed offset, and corrects against the
+// state it held that long ago (CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP).
+// Without that option the pose is applied as a current one.
+typedef struct {
+  float x; // m
+  float y; // m
+  float z; // m
+  uint32_t quat; // compressed quaternion, see quatcompress.h
+  uint16_t age; // 0.1 ms, saturating
+} __attribute__((packed)) extPoseAged;
+
+static void extPoseAgedHandler(const CRTPPacket* pk) {
+  if (pk->size < 1 + sizeof(extPoseAged)) {
+    return;
+  }
+  const extPoseAged* data = (const extPoseAged*)&pk->data[1];
+
+  ext_pose.x = data->x;
+  ext_pose.y = data->y;
+  ext_pose.z = data->z;
+  quatdecompress(data->quat, (float *)&ext_pose.quat.q0);
+  ext_pose.stdDevPos = extPosStdDev;
+  ext_pose.stdDevQuat = extQuatStdDev;
+  ext_pose.aged = 1;
+  ext_pose.hostAge = data->age;
+  ext_pose.rxTimeUs = (uint32_t)usecTimestamp();
 
   estimatorEnqueuePose(&ext_pose);
   tickOfLastPacket = xTaskGetTickCount();
@@ -241,6 +277,7 @@ static void extPosePackedHandler(const CRTPPacket* pk) {
       quatdecompress(item->quat, (float *)&ext_pose.quat.q0);
       ext_pose.stdDevPos = extPosStdDev;
       ext_pose.stdDevQuat = extQuatStdDev;
+      ext_pose.aged = 0;
       estimatorEnqueuePose(&ext_pose);
       tickOfLastPacket = xTaskGetTickCount();
     } else {
@@ -337,6 +374,9 @@ static void genericLocHandle(CRTPPacket* pk)
       break;
     case EXT_POSE_PACKED:
       extPosePackedHandler(pk);
+      break;
+    case EXT_POSE_AGED:
+      extPoseAgedHandler(pk);
       break;
     case LH_PERSIST_DATA:
       lhPersistDataHandler(pk);

@@ -96,6 +96,10 @@
 #include "mm_tdoa_robust.h"
 #include "mm_distance_robust.h"
 
+#ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+#include "usec_time.h"
+#endif
+
 #define DEBUG_MODULE "ESTKALMAN"
 #include "debug.h"
 #include "cfassert.h"
@@ -196,8 +200,33 @@ static const bool useBaroUpdate = true;
 static const bool useBaroUpdate = false;
 #endif
 
+#ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+/**
+ * Delay-compensated external pose (see pose_history.h).
+ *
+ * The total age of an aged pose when it is applied has three parts:
+ *   - how long the sender held it before the radio (in the packet),
+ *   - how long it waited here between decode and this update (measured),
+ *   - everything neither end can time: the mocap system's own latency and
+ *     the radio hop. That part is roughly constant and is the calibrated
+ *     parameter poseD0Ms.
+ */
+static poseHistory_t poseHistory;
+// The time the current state was last propagated to: between two
+// predictions the state does not advance, so this - not "now" - is what the
+// history is stamped with.
+static uint32_t statePredictedUs;
+static uint8_t poseComp = 0;       // 1: correct aged poses against the past state
+static float poseD0Ms = 0.0f;      // fixed latency offset [ms]
+static float poseAgeMs;            // total age of the last aged pose as applied [ms]
+static float poseHostMs;           // the sender's part of it [ms]
+static uint16_t poseDropCount;     // aged poses older than the history, dropped
+static float poseResidual[3];      // position residual of the last pose [m]
+#endif
+
 static void kalmanTask(void* parameters);
 static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlying);
+static void updateWithPose(poseMeasurement_t* pose);
 
 STATIC_MEM_TASK_ALLOC_STACK_NO_DMA_CCM_SAFE(kalmanTask, KALMAN_TASK_STACKSIZE);
 
@@ -258,6 +287,9 @@ static void kalmanTask(void* parameters) {
 
       kalmanCorePredict(&coreData, &coreParams, &accSubSampler.subSample, &gyroSubSampler.subSample, nowMs, quadIsFlying);
       nextPredictionMs = nowMs + PREDICTION_UPDATE_INTERVAL_MS;
+      #ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+      statePredictedUs = (uint32_t)usecTimestamp();
+      #endif
 
       STATS_CNT_RATE_EVENT(&predictionCounter);
 
@@ -275,6 +307,12 @@ static void kalmanTask(void* parameters) {
     {
       STATS_CNT_RATE_EVENT(&finalizeCounter);
     }
+
+    #ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+    // After finalize the attitude error is folded into the quaternion, so
+    // position and q are the whole pose the estimator believes in.
+    poseHistoryPush(&poseHistory, statePredictedUs, &coreData.S[KC_STATE_X], coreData.q);
+    #endif
 
     if (! kalmanSupervisorIsStateWithinBounds(&coreData)) {
       resetEstimation = true;
@@ -332,7 +370,7 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         kalmanCoreUpdateWithPosition(&coreData, &m.data.position);
         break;
       case MeasurementTypePose:
-        kalmanCoreUpdateWithPose(&coreData, &m.data.pose);
+        updateWithPose(&m.data.pose);
         break;
       case MeasurementTypeDistance:
         if(robustTwr){
@@ -377,6 +415,37 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
   }
 }
 
+static void updateWithPose(poseMeasurement_t* pose) {
+#ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+  if (pose->aged) {
+    const uint32_t nowUs = (uint32_t)usecTimestamp();
+    const float hostMs = pose->hostAge * 0.1f;
+    float ageMs = hostMs + (float)(nowUs - pose->rxTimeUs) * 0.001f + poseD0Ms;
+    if (ageMs < 0.0f) {
+      ageMs = 0.0f;
+    }
+    poseHostMs = hostMs;
+    poseAgeMs = ageMs;
+
+    if (poseComp) {
+      if (!kalmanCoreUpdateWithPoseDelayed(&coreData, pose, &poseHistory, nowUs,
+                                           (uint32_t)(ageMs * 1000.0f), statePredictedUs,
+                                           poseResidual)) {
+        // Older than the history: there is nothing to compare it with, and
+        // applying it as current is the error this exists to remove.
+        if (poseDropCount < UINT16_MAX) {
+          poseDropCount++;
+        }
+      }
+      return;
+    }
+  }
+  kalmanCoreUpdateWithPoseAt(&coreData, pose, &coreData.S[KC_STATE_X], coreData.q, poseResidual);
+#else
+  kalmanCoreUpdateWithPose(&coreData, pose);
+#endif
+}
+
 // Called when this estimator is activated
 void estimatorKalmanInit(void)
 {
@@ -398,6 +467,11 @@ void estimatorKalmanInit(void)
 
   uint32_t nowMs = T2M(xTaskGetTickCount());
   kalmanCoreInit(&coreData, &coreParams, nowMs);
+
+  #ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+  poseHistoryReset(&poseHistory);
+  statePredictedUs = (uint32_t)usecTimestamp();
+  #endif
 }
 
 bool estimatorKalmanTest(void)
@@ -531,6 +605,27 @@ LOG_GROUP_START(kalman)
   * @brief Statistics rate full estimation step
   */
   STATS_CNT_RATE_LOG_ADD(rtFinal, &finalizeCounter)
+#ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+  /**
+  * @brief Total age of the last aged external pose as applied [ms]: sender
+  * hold + queueing on the vehicle + poseD0Ms
+  */
+  LOG_ADD(LOG_FLOAT, poseAgeMs, &poseAgeMs)
+  /**
+  * @brief The sender's part of the age, as received in the packet [ms]
+  */
+  LOG_ADD(LOG_FLOAT, poseHostMs, &poseHostMs)
+  /**
+  * @brief Aged poses dropped because they were older than the state history
+  */
+  LOG_ADD(LOG_UINT16, poseDrop, &poseDropCount)
+  /**
+  * @brief Position residual of the last external pose, as applied [m]
+  */
+  LOG_ADD(LOG_FLOAT, poseResX, &poseResidual[0])
+  LOG_ADD(LOG_FLOAT, poseResY, &poseResidual[1])
+  LOG_ADD(LOG_FLOAT, poseResZ, &poseResidual[2])
+#endif
 LOG_GROUP_STOP(kalman)
 
 LOG_GROUP_START(outlierf)
@@ -627,4 +722,17 @@ PARAM_GROUP_START(kalman)
    */
   PARAM_ADD_CORE(PARAM_FLOAT | PARAM_PERSISTENT, cop_z, &coreParams.cop_z)
  
+#ifdef CONFIG_ESTIMATOR_KALMAN_POSE_DELAY_COMP
+/**
+ * @brief Nonzero to correct an aged external pose against the state held
+ * when it was captured (default: 0, the pose is applied as current)
+ */
+  PARAM_ADD(PARAM_UINT8, poseComp, &poseComp)
+/**
+ * @brief Fixed part of the external pose latency [ms]: what neither the
+ * sender nor the vehicle can time (mocap capture latency, radio hop).
+ * Calibrated from a flight (default: 0)
+ */
+  PARAM_ADD(PARAM_FLOAT, poseD0Ms, &poseD0Ms)
+#endif
  PARAM_GROUP_STOP(kalman)
