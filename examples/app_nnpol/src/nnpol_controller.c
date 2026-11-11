@@ -75,6 +75,7 @@
 #include "log.h"
 #include "motors.h"
 #include "param.h"
+#include "platform_defaults.h"
 #include "stabilizer_types.h"
 #include "supervisor.h"
 #include "usec_time.h"
@@ -87,6 +88,11 @@
 /** Policy periods without a fresh action before falling back to the radio
  * setpoint (the shadow host command). */
 #define NNPOL_STALE_FALLBACK_PERIODS 5
+
+/** How long a bench motor value is held after the write that set it. The
+ * bench script rewrites it several times a second; when it stops, so do the
+ * motors. */
+#define NNPOL_BENCH_HOLD_TICKS M2T(300)
 
 /* nnpol.slotState values. */
 #define SLOT_STATE_IDLE 0
@@ -122,6 +128,33 @@ static nnpolRaceTrack_t activeTrack;
 static float racePrevGateX = 1.0f;
 static uint8_t activeGateIdx = 0;
 static uint8_t logGateIdx = 0;
+
+/* Thrust convention of this build, read-only, so the ground station can
+ * refuse a vehicle whose motor values mean something else than it sends.
+ * With CONFIG_ENABLE_THRUST_BAT_COMPENSATED every 16-bit motor value - the
+ * per-motor path included - is read by motorsCompensateBatteryVoltage as a
+ * FORCE, value / 65535 x THRUST_MAX newtons, and turned into a motor voltage
+ * at the measured battery voltage. Without it the value is the PWM ratio. */
+#ifdef CONFIG_ENABLE_THRUST_BAT_COMPENSATED
+static uint8_t paramBatComp = 1;
+static float paramThrustMax = THRUST_MAX;
+#else
+static uint8_t paramBatComp = 0;
+static float paramThrustMax = 0.0f;
+#endif
+
+/* Bench sweep (props on, vehicle restrained): one 16-bit value applied to all
+ * four motors through the same per-motor path a policy's action takes, while
+ * armed and not engaged, for NNPOL_BENCH_HOLD_TICKS after each write. Used to
+ * measure delivered rotor speed against the commanded value. */
+static uint16_t paramBenchPwm = 0;
+static uint32_t benchTick = 0;
+static uint16_t logBench = 0;
+
+static void benchWritten(void)
+{
+  benchTick = xTaskGetTickCount();
+}
 
 /* Policy rate. Writable (the host's policy.inference_hz), defaulting to the
  * selected slot's trained rate; latched into a tick divider at the enable
@@ -439,6 +472,27 @@ static void passthrough(control_t* control, const setpoint_t* setpoint,
   controllerPid(control, setpoint, sensors, state, tick);
 }
 
+/** Four 16-bit motor values in the setpoint shape the (former) per-motor
+ * radio packet produced: modeMotorPwm on all three axes, M1 in thrust and
+ * M2..M4 in attitudeRate, which controllerPid turns into normalized forces
+ * and nothing else. */
+static void motorSetpoint(setpoint_t* sp, uint32_t timestamp, float m1, float m2, float m3, float m4)
+{
+  memset(sp, 0, sizeof(*sp));
+  sp->timestamp = timestamp;
+  sp->mode.x = modeDisable;
+  sp->mode.y = modeDisable;
+  sp->mode.z = modeDisable;
+  sp->mode.quat = modeDisable;
+  sp->mode.roll = modeMotorPwm;
+  sp->mode.pitch = modeMotorPwm;
+  sp->mode.yaw = modeMotorPwm;
+  sp->thrust = m1;
+  sp->attitudeRate.roll = m2;
+  sp->attitudeRate.pitch = m3;
+  sp->attitudeRate.yaw = m4;
+}
+
 void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
                          const sensorData_t* sensors, const state_t* state,
                          const uint32_t tick)
@@ -541,30 +595,31 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
       && periodsWithoutFresh < NNPOL_STALE_FALLBACK_PERIODS;
 
   if (!haveFreshAction) {
+    const bool bench = (nnpolEnable == 0) && paramBenchPwm > 0 && supervisorIsArmed()
+        && (xTaskGetTickCount() - benchTick) < NNPOL_BENCH_HOLD_TICKS;
+    if (bench) {
+      setpoint_t sp;
+      motorSetpoint(&sp, setpoint->timestamp, (float)paramBenchPwm, (float)paramBenchPwm,
+                    (float)paramBenchPwm, (float)paramBenchPwm);
+      logBench = paramBenchPwm;
+      controllerPid(control, &sp, sensors, state, tick);
+      return;
+    }
+    if (paramBenchPwm != 0 && (xTaskGetTickCount() - benchTick) >= NNPOL_BENCH_HOLD_TICKS) {
+      paramBenchPwm = 0;            /* expired: reads back as stopped */
+    }
+    logBench = 0;
     /* Disabled, no slot, no action computed yet, or stale past the
      * fallback threshold: fly the radio setpoint — the shadow host command. */
     passthrough(control, setpoint, sensors, state, tick);
     return;
   }
+  logBench = 0;
 
-  /* Zero-order hold of the latest complete action, in the exact setpoint
-   * shape the (former) per-motor radio packet produced: modeMotorPwm on
-   * all three axes, M1 in thrust and M2..M4 in attitudeRate, which
-   * controllerPid turns into normalized forces and nothing else. */
+  /* Zero-order hold of the latest complete action. */
   setpoint_t sp;
-  memset(&sp, 0, sizeof(sp));
-  sp.timestamp = setpoint->timestamp;
-  sp.mode.x = modeDisable;
-  sp.mode.y = modeDisable;
-  sp.mode.z = modeDisable;
-  sp.mode.quat = modeDisable;
-  sp.mode.roll = modeMotorPwm;
-  sp.mode.pitch = modeMotorPwm;
-  sp.mode.yaw = modeMotorPwm;
-  sp.thrust = cmd.motorPwm[0];
-  sp.attitudeRate.roll = cmd.motorPwm[1];
-  sp.attitudeRate.pitch = cmd.motorPwm[2];
-  sp.attitudeRate.yaw = cmd.motorPwm[3];
+  motorSetpoint(&sp, setpoint->timestamp, cmd.motorPwm[0], cmd.motorPwm[1], cmd.motorPwm[2],
+                cmd.motorPwm[3]);
   controllerPid(control, &sp, sensors, state, tick);
 }
 
@@ -676,6 +731,15 @@ PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, actDim, &paramActDim)
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, kind, &paramKind)
 /** @brief Observation builder of the selected slot (2 = race v3). */
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, taskId, &paramTaskId)
+/** @brief 1 = this build reads every 16-bit motor value as a force and
+ * compensates for battery voltage (CONFIG_ENABLE_THRUST_BAT_COMPENSATED). */
+PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, batComp, &paramBatComp)
+/** @brief The force a motor value of 65535 stands for, N per motor; 0 when
+ * the build does not compensate. */
+PARAM_ADD(PARAM_FLOAT | PARAM_RONLY, thrustMax, &paramThrustMax)
+/** @brief Bench sweep: a 16-bit value applied to all four motors while armed
+ * and not engaged, held for 300 ms after each write. PROPS ON, RESTRAINED. */
+PARAM_ADD_WITH_CALLBACK(PARAM_UINT16, benchPwm, &paramBenchPwm, &benchWritten)
 PARAM_GROUP_STOP(nnpol)
 
 /**
@@ -714,6 +778,8 @@ LOG_ADD(LOG_UINT16, stale, &logStale)
 LOG_ADD(LOG_UINT16, obsErr, &logObsErr)
 /** @brief race: the gate the onboard crossing test is targeting. */
 LOG_ADD(LOG_UINT8, gateIdx, &logGateIdx)
+/** @brief The bench motor value being applied right now, 0 when none. */
+LOG_ADD(LOG_UINT16, bench, &logBench)
 /** @brief Actions computed since boot. */
 LOG_ADD(LOG_UINT32, seq, &logSeq)
 LOG_GROUP_STOP(nnpol)

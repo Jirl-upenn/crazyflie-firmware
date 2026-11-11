@@ -25,6 +25,7 @@ matching tag on `ros_quad_sim2real`.
 | `orpm-p1-mocap-bench` | mocap bench, props off (ROS `orpm-p1-mocap-bench`) | `python -m pytest test_python/test_pose_delay.py`; flash; stream mocap; log `kalman.poseAgeMs`, `poseHostMs`, `poseDrop` | applied age appears and tracks the driver's value; no drops at rest; no "Kalman prediction rate off" on the console |
 | (same commit) | hover, compensation off then on | hover on the SE3 cascade with `kalman.poseComp` 0, then 1 (driver config `pose_delay_comp`) | no change in hover position or heading error between the two; no rate warnings |
 | (same commit) | latency flight (ROS `orpm-p3-latency-flight`) | straight passes at stepped speeds, compensation off then on; run the ROS calibration script on both bags | the off bag gives a stable `d0`; with `kalman.poseD0Ms` set, the on bag's slope is within 2 ms of zero (target) |
+| `orpm-p4-thrust-bench` | thrust bench, as flown so far (ROS `orpm-p4-thrust-bench`). PROPS ON, VEHICLE RESTRAINED | flash; run the ROS repo's `bin/bench/thrust_sweep.py --convention voltage` | the gain and offset of delivered against commanded rotor speed are on record for the per-motor path |
 
 ## Mocap latency compensation
 
@@ -145,10 +146,13 @@ Params (`nnpol.`): `enable` (u8, the engage switch); `nGates`, `gate0`,
 default = the slot's trained rate) — all latched at the `enable` rising
 edge; `slot` (select), `slotErase`; read-only: `slotSel`, `slotState`,
 `slotStatus`, `slotValid`, `nSlots`, `writeSlot`, `writtenBytes`, `runHz`,
-and the selected slot's identity `hash0-3`, `obsDim`, `actDim`, `kind`,
-`taskId`.
+the selected slot's identity `hash0-3`, `obsDim`, `actDim`, `kind`,
+`taskId`, and the build's thrust convention `batComp` (1 = motor values are
+forces, battery compensated) and `thrustMax` (N per motor at 65535).
+`benchPwm` (u16): the bench sweep's motor value, applied to all four motors
+while armed and not engaged, for 300 ms after each write.
 
 Logs (`nnpol.`): `t` (seconds since engage), `act0-3` (clipped network
 output), `pwm0-3` (the decoded per-motor value), `vbx/y/z`, `wbx/y/z`,
 `e0x/y/z` (observation excerpts: body velocity, body rate, target gate
-offset), `us` (inference time), `stale`, `obsErr`, `gateIdx`, `seq`.
+offset), `us` (inference time), `stale`, `obsErr`, `gateIdx`, `seq`, `bench` (the bench value being applied).
