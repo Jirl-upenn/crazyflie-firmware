@@ -1,4 +1,5 @@
-"""The policy slot blob (src/nnpol_slot.h), written and parsed in Python.
+"""The policy slot blob (src/nnpol_slot.h) and the engage context (src/nnpol.h),
+written and parsed in Python.
 
 This is the reference writer for the format: the host tests build synthetic
 blobs with it, and the ground station's compiler (ros_quad_sim2real
@@ -44,6 +45,37 @@ RPM2THRUST = (0.0, -3.133427287299859e-7, 4.407354891648379e-10)
 VMOTOR2RPM = (2938.3995608848436, 6001.834195381014)
 
 assert struct.calcsize(HEADER_FORMAT) == HEADER_BYTES
+
+# Engage context (nnpol.h nnpolContextParse): the track, one checksummed blob.
+CTX_MAGIC = 0x3143504E            # "NPC1"
+CTX_HEADER_BYTES = 16
+CTX_GATE_BYTES = 48
+MAX_GATES = 24
+CTX_MAX_BYTES = CTX_HEADER_BYTES + MAX_GATES * CTX_GATE_BYTES
+CTX_MEM_OFFSET = 5 * SLOT_BYTES   # where the context sits in the app's memory
+
+
+def make_context(positions, normals, tangents, ups, gate_side, gate0=0):
+    """The engage context for a track: per gate its centre and its frame (unit
+    approach normal, lateral tangent, up), the PHYSICAL gate's side and the
+    first target gate.
+
+        u32 magic "NPC1" | u32 crc32 over bytes [8, total) | u16 total |
+        u8 nGates | u8 gate0 | f32 gateSide | nGates x 12 f32
+    """
+    gates = np.concatenate([np.asarray(a, dtype="<f4").reshape(-1, 3)
+                            for a in (positions, normals, tangents, ups)], axis=1)
+    n = gates.shape[0]
+    if not 1 <= n <= MAX_GATES:
+        raise ValueError(f"{n} gates: the vehicle takes 1 to {MAX_GATES}")
+    total = CTX_HEADER_BYTES + n * CTX_GATE_BYTES
+    body = struct.pack("<HBBf", total, n, int(gate0), float(gate_side)) + gates.tobytes()
+    return struct.pack("<II", CTX_MAGIC, zlib.crc32(body) & 0xFFFFFFFF) + body
+
+
+def context_crc(ctx):
+    """What the vehicle reports in nnpol.ctxCrc once it has validated ctx."""
+    return struct.unpack_from("<I", ctx, 4)[0]
 
 
 def hash_words(blob):

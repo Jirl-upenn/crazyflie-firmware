@@ -6,8 +6,10 @@
  * Architecture (mjc_dronetests/docs/onboard_inference_plan.md section 3):
  * the OOT controller hook runs in the STABILIZER task at 1 kHz. On every
  * policy tick (every RATE_MAIN_LOOP / nnpol.ctrlHz stabilizer ticks) it
- * snapshots the EKF state + gyro and notifies the APP task, which builds
- * the observation, runs the selected slot's network through the
+ * snapshots the EKF state + gyro + rotor speeds and notifies the APP task,
+ * which runs one policy step (nnpolCoreStep, the same function the host
+ * parity library exports): the gate state, the observation, the selected
+ * slot's network through the
  * interpreter (nnpol_policy.c, 0.3-0.8 ms for a 2x128 — too close to the
  * 1 ms stabilizer budget to run inline, which is the whole reason for the
  * task split), decodes the action and publishes it into a sequence-locked
@@ -42,9 +44,11 @@
  *
  * Engage protocol (the ground station's side is the onboard client of
  * ros_quad_sim2real `onboard-rpm`): select the slot, verify nnpol.hash0-3
- * against the blob the host compiled, push the track (nnpol.nGates / gate0 /
- * g*), rpmScale and ctrlHz, then set enable = 1. The rising edge latches the
- * pushed values, so nothing written mid-run moves the track.
+ * against the blob the host compiled and nnpol.coreVer against its parity
+ * library, write the engage context (the track: MEM_TYPE_APP at
+ * NNPOL_CTX_MEM_OFFSET) and verify nnpol.ctxCrc, push rpmScale and ctrlHz,
+ * then set enable = 1. enable is ignored without a validated context. The
+ * rising edge latches everything, so nothing written mid-run moves the track.
  *
  * Policy rate: nnpol.ctrlHz is writable and defaults to the selected
  * slot's trained ctrl_freq. The rising edge turns it into a tick divider
@@ -107,25 +111,27 @@
 // --------------------------------------------------------------------------
 
 static uint8_t nnpolEnable = 0;
-static float paramRpmScale = 1.0f;  /* MOTOR kind: the host's motor_pwm.rpm_scale */
+static float paramRpmScale = 1.0f;  /* the host's motor_pwm.rpm_scale */
 /* Latched from the param at the enable rising edge, so a mid-run param
  * write cannot rescale the motors; read by the app task. */
-static float activeRpmScale = 1.0f;
-/* motorobs: the last valid reading per motor, normalized. Starts at hover
- * (1.0) — a state a flying drone is in, unlike zero — and holds through
- * DSHOT telemetry dropouts, exactly as the host's set_motor_rpm does. */
-static float heldRpm[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-/* The track as the host placed it (nnpol.g*), the first target gate
- * (nnpol.gate0) — latched at the rising edge — and the gate state the
- * stabilizer advances every policy tick (RacePlugin.step's crossing test).
- * activeTrack changes only at the rising edge, before the first snapshot of
- * the run, so the app task reads it without a lock. */
-static uint8_t paramNGates = 0;
-static uint8_t paramGate0 = 0;
-static float paramGates[NNPOL_MAX_GATES][6];   /* x y z nx ny nz per gate */
-static nnpolRaceTrack_t activeTrack;
-static float racePrevGateX = 1.0f;
-static uint8_t activeGateIdx = 0;
+static float latchedRpmScale = 1.0f;
+/* motorobs: the last valid reading per motor, rpm, held through DSHOT
+ * telemetry dropouts exactly as the host's set_motor_rpm does. Until the
+ * first reading the observation gets the slot's hover speed — a state a
+ * flying drone is in, unlike zero. */
+static float heldRpm[4];
+static bool haveRpm[4];
+
+/* The engage context: the track the host wrote (nnpol_slot_bank.c stages
+ * the bytes), parsed and validated by the app task while nothing is
+ * engaged. A policy cannot engage without a valid one. */
+static nnpolRaceTrack_t pendingTrack;
+static volatile bool pendingTrackOk = false;
+static uint32_t ctxWriteSeen = 0;
+static uint8_t paramCtxStatus = NNPOL_CTX_EMPTY;  /* nnpolCtxStatus_t of the last parse */
+static uint32_t paramCtxCrc = 0;                  /* CRC of the validated context, 0 = none */
+static uint8_t paramMaxGates = NNPOL_MAX_GATES;
+static uint16_t paramCoreVer = NNPOL_CORE_VERSION;
 static uint8_t logGateIdx = 0;
 
 /* Thrust convention of this build, read-only, so the ground station can
@@ -188,8 +194,14 @@ static uint16_t paramTaskId = 0xFFFF;
 // through activeValid, which changes only while disengaged)
 // --------------------------------------------------------------------------
 
-static nnpolPolicy_t activePolicy = { NULL, NULL };
+/* The policy step's state: the selected policy, the latched track and the
+ * gate state. Owned by the app task. */
+static nnpolCore_t core;
 static volatile bool activeValid = false;
+/* Bumped by the stabilizer at every enable rising edge; the app task starts
+ * a run (latches the track, resets the gate state) when it sees a new value. */
+static volatile uint32_t engageCount = 0;
+static uint32_t engageSeen = 0;
 
 static void publishIdentity(const nnpolSlotHeader_t* h)
 {
@@ -213,8 +225,7 @@ static void publishIdentity(const nnpolSlotHeader_t* h)
 static void selectSlot(uint8_t slot)
 {
   activeValid = false;
-  activePolicy.hdr = NULL;
-  activePolicy.weights = NULL;
+  nnpolCoreSetPolicy(&core, NULL, 0);
   if (slot == NNPOL_SLOT_NONE || slot >= NNPOL_NUM_SLOTS) {
     paramSlotSel = NNPOL_SLOT_NONE;
     paramSlotStatus = NNPOL_SLOT_EMPTY;
@@ -223,7 +234,7 @@ static void selectSlot(uint8_t slot)
     return;
   }
   const nnpolSlotHeader_t* h = nnpolSlotBankHeader(slot);
-  const nnpolSlotStatus_t st = nnpolSlotValidate(h, NNPOL_SLOT_BYTES);
+  const nnpolSlotStatus_t st = nnpolCoreSetPolicy(&core, h, NNPOL_SLOT_BYTES);
   paramSlotStatus = (uint8_t)st;
   nnpolSlotBankRescan();
   paramSlotValid = nnpolSlotBankValidMask();
@@ -234,8 +245,6 @@ static void selectSlot(uint8_t slot)
     DEBUG_PRINT("slot %d rejected: %s\n", slot, nnpolSlotStatusName(st));
     return;
   }
-  activePolicy.hdr = h;
-  activePolicy.weights = nnpolSlotWeights(h);
   if (nnpolObsDim(h) != (int)h->obsDim) {
     /* Selectable but not flyable: the identity is published so the ground
      * station can say which run it is, and every policy tick then counts
@@ -257,6 +266,12 @@ static void selectSlot(uint8_t slot)
 // Single writer (stabilizer task), single reader (app task). The writer
 // bumps the counter to odd, writes, bumps to even; the reader retries
 // until it sees the same even value on both sides of its copy.
+
+/** The estimator state of one policy tick and its run clock. */
+typedef struct {
+  float t;               /* seconds since engage */
+  nnpolState_t state;
+} nnpolSnapshot_t;
 
 static nnpolSnapshot_t snapBuf;
 static volatile uint32_t snapLock = 0;
@@ -367,11 +382,27 @@ static void housekeeping(void)
   }
   paramWriteSlot = nnpolSlotBankWriteSlot();
   paramWrittenBytes = nnpolSlotBankWrittenBytes();
+
+  /* The engage context arrives in chunks: every pass that sees new bytes
+   * parses the whole region again, and only a blob whose CRC and track check
+   * out becomes the pending track. A failed parse keeps the engage blocked. */
+  uint32_t writeCount;
+  const uint8_t* staged = nnpolContextStaged(&writeCount);
+  if (writeCount != ctxWriteSeen) {
+    ctxWriteSeen = writeCount;
+    uint32_t crc = 0;
+    pendingTrackOk = false;
+    const nnpolCtxStatus_t st = nnpolContextParse(staged, NNPOL_CTX_MAX_BYTES, &pendingTrack, &crc);
+    paramCtxStatus = (uint8_t)st;
+    paramCtxCrc = (st == NNPOL_CTX_OK) ? crc : 0u;
+    pendingTrackOk = (st == NNPOL_CTX_OK);
+  }
 }
 
 void appMain()
 {
   appTaskHandle = xTaskGetCurrentTaskHandle();
+  nnpolCoreInit(&core);
   /* nnpolSlotBankInit ran in controllerOutOfTreeInit, before the scheduler. */
   paramSlotValid = nnpolSlotBankValidMask();
   DEBUG_PRINT("nnpol: %d slots, valid mask 0x%02x\n", NNPOL_NUM_SLOTS, paramSlotValid);
@@ -388,39 +419,38 @@ void appMain()
     nnpolSnapshot_t snap;
     snapshotRead(&snap);
 
+    if (engageSeen != engageCount) {
+      /* A new run: the track the host pushed, the gate state as at reset.
+       * pendingTrack is only written by housekeeping above, in this task
+       * and never while engaged, so it is stable here. */
+      engageSeen = engageCount;
+      nnpolCoreSetTrack(&core, &pendingTrack);
+      nnpolCoreEngage(&core, THRUST_MAX, latchedRpmScale);
+    }
+
     const uint64_t tStart = usecTimestamp();
 
-    float obs[NNPOL_MAX_OBS_DIM];
-    const int obsDim = nnpolBuildObs(activePolicy.hdr, &activeTrack, &snap, obs);
-    if (obsDim != (int)activePolicy.hdr->obsDim) {
+    static nnpolStepOut_t out;
+    if (!nnpolCoreStep(&core, &snap.state, &out)) {
       if (logObsErr < 0xFFFFu) { logObsErr++; }
       continue;                     /* no action: the stale fallback takes over */
     }
 
-    float act[NNPOL_ACTION_DIM];
-    nnpolForward(&activePolicy, obs, act);
-    for (int i = 0; i < NNPOL_ACTION_DIM; i++) {
-      if (act[i] < -1.0f) { act[i] = -1.0f; }
-      if (act[i] > 1.0f) { act[i] = 1.0f; }
-    }
-
-    nnpolCmd_t cmd;
-    nnpolDecodeAction(activePolicy.hdr, act, THRUST_MAX, activeRpmScale, &cmd);
-
     const uint64_t elapsed = usecTimestamp() - tStart;
 
-    actionWrite(&cmd);
+    actionWrite(&out.cmd);
 
     /* Log fields: written only here (single writer), read by the log
      * framework whenever a block samples them. */
     logT = snap.t;
-    memcpy(logAct, act, sizeof(logAct));
+    memcpy(logAct, out.act, sizeof(logAct));
     for (int i = 0; i < 4; i++) {
-      logPwm[i] = (uint16_t)cmd.motorPwm[i];
+      logPwm[i] = (uint16_t)out.cmd.motorPwm[i];
     }
-    memcpy(logVb, &obs[0], sizeof(logVb));   /* v_B */
-    memcpy(logWb, &obs[3], sizeof(logWb));   /* omega_B */
-    memcpy(logE0, &obs[9], sizeof(logE0));   /* target gate offset, body frame */
+    memcpy(logVb, &out.obs[0], sizeof(logVb));   /* v_B */
+    memcpy(logWb, &out.obs[3], sizeof(logWb));   /* omega_B */
+    memcpy(logE0, &out.obs[9], sizeof(logE0));   /* target gate offset, body frame */
+    logGateIdx = out.gateIdx;
     logUs = (uint16_t)(elapsed > 0xFFFFu ? 0xFFFFu : elapsed);
     logSeq++;
   }
@@ -495,27 +525,19 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
                          const sensorData_t* sensors, const state_t* state,
                          const uint32_t tick)
 {
-  const bool enabled = (nnpolEnable != 0) && activeValid;
+  /* No policy without a validated track: enable is ignored until the host
+   * has written a context that parsed. */
+  const bool enabled = (nnpolEnable != 0) && activeValid && pendingTrackOk;
   nnpolSlotBankSetLocked(nnpolEnable != 0 || supervisorIsArmed());
+  nnpolContextSetLocked(nnpolEnable != 0);
 
   if (enabled && !wasEnabled) {
-    /* Rising edge: the run clock starts NOW, with the values the host
-     * pushed before flipping enable. Latching them here (not reading the
-     * params live) means a mid-run param write cannot move the track or
-     * rescale the motors. */
+    /* Rising edge: the run clock starts NOW. The rpm scale is latched here
+     * and the track by the app task on its first step of the run, so
+     * nothing written mid-run moves the track or rescales the motors. */
     t0Tick = tick;
-    activeRpmScale = paramRpmScale;
-    /* The race track and its state: gate_idx = initial_gate, prev_gate_x
-     * = 1.0, as RacePlugin.reset_task_state / RaceV3.reset. */
-    activeTrack.nGates = paramNGates > NNPOL_MAX_GATES ? NNPOL_MAX_GATES : paramNGates;
-    for (int i = 0; i < NNPOL_MAX_GATES; i++) {
-      for (int k = 0; k < 3; k++) {
-        activeTrack.gates[i][k] = paramGates[i][k];
-        activeTrack.normals[i][k] = paramGates[i][3 + k];
-      }
-    }
-    activeGateIdx = activeTrack.nGates ? (uint8_t)(paramGate0 % activeTrack.nGates) : 0;
-    racePrevGateX = 1.0f;
+    latchedRpmScale = paramRpmScale;
+    engageCount++;
     activeDivider = tickDividerFor(paramCtrlHz);
     paramRunHz = (uint16_t)(RATE_MAIN_LOOP / activeDivider);
     nnpolCmd_t unused;
@@ -533,37 +555,30 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
      * scalar-first — reordered here. */
     nnpolSnapshot_t snap;
     snap.t = (float)(tick - t0Tick) * 0.001f;
-    snap.pos[0] = state->position.x;
-    snap.pos[1] = state->position.y;
-    snap.pos[2] = state->position.z;
-    snap.quat_wxyz[0] = state->attitudeQuaternion.w;
-    snap.quat_wxyz[1] = state->attitudeQuaternion.x;
-    snap.quat_wxyz[2] = state->attitudeQuaternion.y;
-    snap.quat_wxyz[3] = state->attitudeQuaternion.z;
-    snap.vel_w[0] = state->velocity.x;
-    snap.vel_w[1] = state->velocity.y;
-    snap.vel_w[2] = state->velocity.z;
-    snap.gyro_deg[0] = sensors->gyro.x;
-    snap.gyro_deg[1] = sensors->gyro.y;
-    snap.gyro_deg[2] = sensors->gyro.z;
-    /* Race gate state, advanced with the EKF position (the host advances
-     * its shadow copy with mocap): the crossing test costs a dot product
-     * and runs here so the app task sees one consistent gate per tick. */
-    if (activeValid && activePolicy.hdr->taskId == NNPOL_TASK_RACE_V3) {
-      nnpolRaceUpdateGate(&activeTrack, activePolicy.hdr->task[NNPOL_TASK_GATE_SIDE],
-                          snap.pos, &activeGateIdx, &racePrevGateX);
-      logGateIdx = activeGateIdx;
-    }
-    snap.gateIdx = activeGateIdx;
-    /* Bidirectional-DSHOT rotor speed (motors.c): UINT16_MAX = invalid or
-     * no reply, held per motor. Read on every policy tick regardless of the
-     * slot's observation so the hold is warm when a motorobs slot engages. */
+    snap.state.pos[0] = state->position.x;
+    snap.state.pos[1] = state->position.y;
+    snap.state.pos[2] = state->position.z;
+    snap.state.quat_wxyz[0] = state->attitudeQuaternion.w;
+    snap.state.quat_wxyz[1] = state->attitudeQuaternion.x;
+    snap.state.quat_wxyz[2] = state->attitudeQuaternion.y;
+    snap.state.quat_wxyz[3] = state->attitudeQuaternion.z;
+    snap.state.vel_w[0] = state->velocity.x;
+    snap.state.vel_w[1] = state->velocity.y;
+    snap.state.vel_w[2] = state->velocity.z;
+    snap.state.gyro_deg[0] = sensors->gyro.x;
+    snap.state.gyro_deg[1] = sensors->gyro.y;
+    snap.state.gyro_deg[2] = sensors->gyro.z;
+    /* Bidirectional-DSHOT rotor speed (motors.c), sampled on the same tick
+     * as the estimator state: UINT16_MAX = invalid or no reply, held per
+     * motor. core.policy is stable while engaged (the app task changes it
+     * only while disengaged). */
     for (int i = 0; i < 4; i++) {
       const uint16_t raw = motorsGetRPM(i);
       if (raw != UINT16_MAX) {
-        heldRpm[i] = (float)raw / NNPOL_NOMINAL_HOVER_RPM;
+        heldRpm[i] = (float)raw;
+        haveRpm[i] = true;
       }
-      snap.rpm[i] = heldRpm[i];
+      snap.state.rpm[i] = haveRpm[i] ? heldRpm[i] : core.policy.hdr->hoverRpm;
     }
     snapshotWrite(&snap);
 
@@ -634,59 +649,18 @@ PARAM_GROUP_START(nnpol)
  * format-compatible takeover by the host stream. Has no effect without a
  * selected, valid slot. */
 PARAM_ADD(PARAM_UINT8, enable, &nnpolEnable)
-/** @brief The track as the host placed it for this run: gates in use, the
- * first target gate, and per gate the world position (m) and unit approach
- * normal. Latched at the enable rising edge. */
-PARAM_ADD(PARAM_UINT8, nGates, &paramNGates)
-PARAM_ADD(PARAM_UINT8, gate0, &paramGate0)
-PARAM_ADD(PARAM_FLOAT, g0x, &paramGates[0][0])
-PARAM_ADD(PARAM_FLOAT, g0y, &paramGates[0][1])
-PARAM_ADD(PARAM_FLOAT, g0z, &paramGates[0][2])
-PARAM_ADD(PARAM_FLOAT, g0nx, &paramGates[0][3])
-PARAM_ADD(PARAM_FLOAT, g0ny, &paramGates[0][4])
-PARAM_ADD(PARAM_FLOAT, g0nz, &paramGates[0][5])
-PARAM_ADD(PARAM_FLOAT, g1x, &paramGates[1][0])
-PARAM_ADD(PARAM_FLOAT, g1y, &paramGates[1][1])
-PARAM_ADD(PARAM_FLOAT, g1z, &paramGates[1][2])
-PARAM_ADD(PARAM_FLOAT, g1nx, &paramGates[1][3])
-PARAM_ADD(PARAM_FLOAT, g1ny, &paramGates[1][4])
-PARAM_ADD(PARAM_FLOAT, g1nz, &paramGates[1][5])
-PARAM_ADD(PARAM_FLOAT, g2x, &paramGates[2][0])
-PARAM_ADD(PARAM_FLOAT, g2y, &paramGates[2][1])
-PARAM_ADD(PARAM_FLOAT, g2z, &paramGates[2][2])
-PARAM_ADD(PARAM_FLOAT, g2nx, &paramGates[2][3])
-PARAM_ADD(PARAM_FLOAT, g2ny, &paramGates[2][4])
-PARAM_ADD(PARAM_FLOAT, g2nz, &paramGates[2][5])
-PARAM_ADD(PARAM_FLOAT, g3x, &paramGates[3][0])
-PARAM_ADD(PARAM_FLOAT, g3y, &paramGates[3][1])
-PARAM_ADD(PARAM_FLOAT, g3z, &paramGates[3][2])
-PARAM_ADD(PARAM_FLOAT, g3nx, &paramGates[3][3])
-PARAM_ADD(PARAM_FLOAT, g3ny, &paramGates[3][4])
-PARAM_ADD(PARAM_FLOAT, g3nz, &paramGates[3][5])
-PARAM_ADD(PARAM_FLOAT, g4x, &paramGates[4][0])
-PARAM_ADD(PARAM_FLOAT, g4y, &paramGates[4][1])
-PARAM_ADD(PARAM_FLOAT, g4z, &paramGates[4][2])
-PARAM_ADD(PARAM_FLOAT, g4nx, &paramGates[4][3])
-PARAM_ADD(PARAM_FLOAT, g4ny, &paramGates[4][4])
-PARAM_ADD(PARAM_FLOAT, g4nz, &paramGates[4][5])
-PARAM_ADD(PARAM_FLOAT, g5x, &paramGates[5][0])
-PARAM_ADD(PARAM_FLOAT, g5y, &paramGates[5][1])
-PARAM_ADD(PARAM_FLOAT, g5z, &paramGates[5][2])
-PARAM_ADD(PARAM_FLOAT, g5nx, &paramGates[5][3])
-PARAM_ADD(PARAM_FLOAT, g5ny, &paramGates[5][4])
-PARAM_ADD(PARAM_FLOAT, g5nz, &paramGates[5][5])
-PARAM_ADD(PARAM_FLOAT, g6x, &paramGates[6][0])
-PARAM_ADD(PARAM_FLOAT, g6y, &paramGates[6][1])
-PARAM_ADD(PARAM_FLOAT, g6z, &paramGates[6][2])
-PARAM_ADD(PARAM_FLOAT, g6nx, &paramGates[6][3])
-PARAM_ADD(PARAM_FLOAT, g6ny, &paramGates[6][4])
-PARAM_ADD(PARAM_FLOAT, g6nz, &paramGates[6][5])
-PARAM_ADD(PARAM_FLOAT, g7x, &paramGates[7][0])
-PARAM_ADD(PARAM_FLOAT, g7y, &paramGates[7][1])
-PARAM_ADD(PARAM_FLOAT, g7z, &paramGates[7][2])
-PARAM_ADD(PARAM_FLOAT, g7nx, &paramGates[7][3])
-PARAM_ADD(PARAM_FLOAT, g7ny, &paramGates[7][4])
-PARAM_ADD(PARAM_FLOAT, g7nz, &paramGates[7][5])
+/** @brief nnpolCtxStatus_t of the engage context as last parsed: 0 ok,
+ * 1 empty, 2 bad magic, 3 bad size, 4 bad crc, 5 bad track. A policy does
+ * not engage unless this is 0. */
+PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, ctxStatus, &paramCtxStatus)
+/** @brief CRC of the validated engage context (its own crc32 field), 0 when
+ * none is valid: the ground station compares it with what it wrote. */
+PARAM_ADD(PARAM_UINT32 | PARAM_RONLY, ctxCrc, &paramCtxCrc)
+/** @brief Gates a track may have. */
+PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, maxGates, &paramMaxGates)
+/** @brief NNPOL_CORE_VERSION of this image: the ground station's parity
+ * library must report the same. */
+PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, coreVer, &paramCoreVer)
 /** @brief rpm multiplier before the thrust map (host motor_pwm.rpm_scale). */
 PARAM_ADD(PARAM_FLOAT, rpmScale, &paramRpmScale)
 /** @brief Policy rate (Hz) latched at the enable rising edge. Defaults to

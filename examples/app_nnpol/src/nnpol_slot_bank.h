@@ -2,7 +2,8 @@
  * nnpol_slot_bank.h — the flash slot bank: NNPOL_NUM_SLOTS policy blobs
  * (nnpol_slot.h) resident in the internal-flash sectors the firmware
  * image never reaches, uploaded over the radio through a MEM_TYPE_APP
- * memory handler and selected at run time. Firmware-only (flash, IWDG,
+ * memory handler and selected at run time, plus the RAM region the engage
+ * context is written to. Firmware-only (flash, IWDG,
  * mem subsystem); the format itself is in nnpol_slot_format.c.
  *
  * Geometry: STM32F405 sectors 7..11 are 128 KB each at 0x08060000..
@@ -52,6 +53,17 @@ bool nnpolSlotBankErase(uint8_t slot);
 /** While locked, radio writes and erases are refused: set by the
  * controller for as long as a policy is engaged or the vehicle armed. */
 void nnpolSlotBankSetLocked(bool locked);
+
+/** The engage context (nnpol.h, the track): a small RAM region mapped
+ * right after the bank in the same MEM_TYPE_APP memory, at
+ * NNPOL_CTX_MEM_OFFSET. Unlike the flash slots it may be written while
+ * armed and flying - a policy is engaged from a hover - but not while a
+ * policy is engaged. nnpolContextStaged returns the staged bytes and a
+ * counter that changes with every accepted write; the app task parses and
+ * validates them (nnpolContextParse) before anything uses them. */
+#define NNPOL_CTX_MEM_OFFSET (NNPOL_NUM_SLOTS * NNPOL_SLOT_BYTES)
+const uint8_t* nnpolContextStaged(uint32_t* writeCount);
+void nnpolContextSetLocked(bool locked);
 
 /** Upload bookkeeping, for the ground station (params): the slot the last
  * radio write landed in and how many bytes of it have been written since

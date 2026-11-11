@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """Host parity check for app_nnpol:
 
-    python3 examples/app_nnpol/test/run_host_parity.py [--blob policy_slot.bin] [--snapshots N]
+    python3 examples/app_nnpol/test/run_host_parity.py [--blob policy_slot.bin] [--cases N]
 
-Builds test_policy_host.c with plain gcc against the SAME pure-C modules the
-firmware compiles (slot format, interpreter, observation, decode), loads a
-slot blob exactly as the firmware reads a flash slot, and checks, in order
-of what would hurt most in the air:
+Builds libnnpol_core.so - the SAME pure-C files the firmware compiles, behind
+the flat entry point of nnpol_host.c - and runs policy steps through it
+exactly as the vehicle's app task does (nnpolCoreStep), comparing every stage
+with numpy transcriptions of the host implementation. In order of what would
+hurt most in the air:
 
   1. slot validation - magic, sizes, dims, CRC, as the firmware's select
      does; the identity words equal the digest of the blob; blobs the
      firmware must refuse (bad CRC, wrong action kind, unknown action map,
      over the interpreter limits) are refused.
-  2. network parity - random observations through the C interpreter against
-     a numpy forward pass over the weights parsed out of the same blob.
-  3. observation parity - random EKF snapshots and tracks through
-     nnpolBuildObs against a numpy transcription of the host's RaceV3 /
-     RaceV3MotorObs.observe.
-  4. gate state - the crossing test against its numpy transcription.
-  5. action-decode parity - random actions through nnpolDecodeAction against
-     a numpy transcription of the host's MotorPwmRacingPolicy.decode: action
-     map, thrust curve, motor value as a fraction of THRUST_MAX.
-  6. end to end - snapshot -> obs -> network -> clip -> decode in one C pass
-     against the same chain in numpy.
+  2. engage context - a track round-trips; a bad CRC, an empty or oversized
+     track, a first gate out of range and a non-unit axis are refused, and a
+     policy without a track produces no command.
+  3. network - random observations through the C interpreter against a numpy
+     forward pass over the weights parsed out of the same blob.
+  4. one step - random states on random tracks (level and pitched gates):
+     the observation against RaceV3 / RaceV3MotorObs.observe, the clipped
+     action, and the decode (action map, thrust curve, motor value) against
+     MotorPwmRacingPolicy.decode.
+  5. gate state - random two-step paths around the target gate against
+     RaceV3._update_gate (the trainer's plane_crossings test), and whole
+     laps through every gate of a track, dive gates included.
 
 Without --blob the checks run over synthetic random-weight blobs covering
 both observations (v3, v3_motorobs), both action maps (rpm_hover,
@@ -32,51 +34,20 @@ trainer run directory. With --blob they run on that blob alone.
 Exit code 0 = all parity bounds met.
 """
 import argparse
-import shutil
-import subprocess
+import struct
 import sys
-import tempfile
+import zlib
 from pathlib import Path
 
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "src"
 sys.path.insert(0, str(HERE))
 import nnpol_blob  # noqa: E402
+import nnpol_core  # noqa: E402
 
-MAX_GATES = 8
-SNAP_FLOATS = 19                    # test_policy_host.c
-TRACK_FLOATS = 1 + 6 * MAX_GATES
-CMD_FLOATS = 12
 THRUST_MAX = 0.2                    # platform_defaults_cf21bl.h, N per motor
 RPM_SCALE = 1.0
-C_SOURCES = ("nnpol_slot_format.c", "nnpol_policy.c", "nnpol_obs_race.c", "nnpol_action.c")
-
-
-def build(tmp):
-    cc = shutil.which("gcc") or shutil.which("cc")
-    if cc is None:
-        sys.exit("no host C compiler")
-    exe = tmp / "nnpol_host"
-    subprocess.run(
-        [cc, "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(exe),
-         str(HERE / "test_policy_host.c"), *[str(SRC / s) for s in C_SOURCES],
-         "-I", str(SRC), "-lm"], check=True)
-    return exe
-
-
-def run(exe, blob, mode, data, out_floats):
-    r = subprocess.run([str(exe), mode, str(blob)], input=data.astype(np.float32).tobytes(),
-                       capture_output=True, check=True)
-    return np.frombuffer(r.stdout, dtype=np.float32).reshape(-1, out_floats)
-
-
-def status_of(exe, blob_bytes, tmp):
-    path = tmp / "probe.bin"
-    path.write_bytes(blob_bytes)
-    out = subprocess.run([str(exe), "info", str(path)], capture_output=True, text=True).stdout
-    return int(out.split()[0])
 
 
 # -- numpy mirrors ----------------------------------------------------------
@@ -89,41 +60,61 @@ def quat_to_R(q):
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
 
 
-def split_track(track):
-    n = int(track[0])
-    return (n, track[1:1 + 3 * MAX_GATES].reshape(MAX_GATES, 3),
-            track[1 + 3 * MAX_GATES:1 + 6 * MAX_GATES].reshape(MAX_GATES, 3))
+class Track:
+    """A track as the host holds it (RaceV3): positions and the gate frames."""
+
+    def __init__(self, pos, normals, tangents, ups, side, gate0=0):
+        self.pos, self.normals, self.tangents, self.ups = pos, normals, tangents, ups
+        self.side, self.gate0, self.n = float(side), int(gate0), len(pos)
+
+    def context(self):
+        return nnpol_blob.make_context(self.pos, self.normals, self.tangents, self.ups,
+                                       self.side, self.gate0)
+
+    def update_gate(self, idx, prev, pos):
+        """RaceV3._update_gate's pass test (GateTrack.plane_crossings)."""
+        rel0, rel1 = prev - self.pos[idx], pos - self.pos[idx]
+        x0, x1 = float(rel0 @ self.normals[idx]), float(rel1 @ self.normals[idx])
+        if not (x0 > 0.0 and x1 <= 0.0):
+            return idx, False
+        s = x0 / (x0 - x1)
+        at = rel0 + s * (rel1 - rel0)
+        half = self.side * 0.5
+        if abs(at @ self.tangents[idx]) < half and abs(at @ self.ups[idx]) < half:
+            return (idx + 1) % self.n, True
+        return idx, False
 
 
-def np_obs(snap, track, H):
+def random_track(rng, n_gates=None, max_gates=None):
+    """Gates on a loop. Most are level (normal horizontal, up = world z); some
+    are pitched, down to a horizontal dive gate whose normal is vertical."""
+    n = int(rng.integers(2, (max_gates or 8) + 1)) if n_gates is None else n_gates
+    thetas = np.sort(rng.uniform(-np.pi, np.pi, n))
+    radius = rng.uniform(1.5, 4.0)
+    pos = np.stack([radius * np.cos(thetas), radius * np.sin(thetas),
+                    rng.uniform(0.6, 2.0, n)], axis=1)
+    heading = thetas + np.pi / 2 + rng.uniform(-0.3, 0.3, n)
+    pitch = np.where(rng.random(n) < 0.3, rng.choice([-np.pi / 2, -0.6, 0.5], n), 0.0)
+    travel = np.stack([np.cos(heading) * np.cos(pitch), np.sin(heading) * np.cos(pitch),
+                       np.sin(pitch)], axis=1)
+    tangents = np.stack([-np.sin(heading), np.cos(heading), np.zeros(n)], axis=1)
+    ups = np.cross(travel, tangents)
+    return Track(pos, -travel, tangents, ups, side=rng.choice([0.4, 1.0]),
+                 gate0=int(rng.integers(0, n)))
+
+
+def np_obs(H, track, idx, pos, q, v_w, gyro_deg, rpm):
     """RaceV3.observe: body velocity and rate, gravity in body, the current and
-    next gate's offset and approach normal in body, [+ rotor speeds]."""
-    pos, q, v_w, gyro, rpm = snap[1:4], snap[4:8], snap[8:11], snap[11:14], snap[14:18]
-    n_gates, gates, normals = split_track(track)
-    idx = int(snap[18]) % n_gates
-    nxt = (idx + 1) % n_gates
+    next gate's offset and approach normal in body, [+ rotor speeds / hover]."""
     R = quat_to_R(q / np.linalg.norm(q))
     Rt = R.T
-    parts = [Rt @ v_w, np.radians(gyro), R[2, :],
-             Rt @ (gates[idx] - pos), Rt @ (gates[nxt] - pos),
-             Rt @ normals[idx], Rt @ normals[nxt]]
+    nxt = (idx + 1) % track.n
+    parts = [Rt @ v_w, np.radians(gyro_deg), R[2, :],
+             Rt @ (track.pos[idx] - pos), Rt @ (track.pos[nxt] - pos),
+             Rt @ track.normals[idx], Rt @ track.normals[nxt]]
     if H["motorobs"]:
-        parts.append(rpm)
+        parts.append(rpm / H["hover_rpm"])
     return np.concatenate(parts)
-
-
-def np_update_gate(track, gate_side, pos, gate_idx, prev_gate_x):
-    """RacePlugin.step's crossing test."""
-    n_gates, gates, normals = track
-    g, n = gates[gate_idx], normals[gate_idx]
-    rel = pos - g
-    x = float(np.dot(rel, n))
-    y = rel[1] * n[0] - rel[0] * n[1]
-    z = rel[2]
-    half = gate_side * 0.5
-    if x < 0.0 and prev_gate_x > 0.0 and abs(y) < half and abs(z) < half:
-        return (gate_idx + 1) % n_gates, 1.0
-    return gate_idx, x
 
 
 def np_rpm_to_thrust(rpm, H):
@@ -147,13 +138,9 @@ def np_mix(a, H):
 
 
 def np_decode(action, thrust_max, rpm_scale, H):
-    a = np.clip(action, -1, 1)
-    out = np.zeros(CMD_FLOATS)
-    rpm = np_mix(a, H) * rpm_scale
-    out[0:4] = rpm
-    out[4:8] = np_rpm_to_thrust(rpm, H)
-    out[8:12] = np_thrust_to_motor(out[4:8], thrust_max)
-    return out
+    rpm = np_mix(np.clip(action, -1, 1), H) * rpm_scale
+    thrust = np_rpm_to_thrust(rpm, H)
+    return rpm, thrust, np_thrust_to_motor(thrust, thrust_max)
 
 
 def np_forward(H, obs):
@@ -166,33 +153,10 @@ def np_forward(H, obs):
     return np.tanh(x) if H["output_squash"] else x
 
 
-def random_cases(rng, n):
-    """Plausible engaged-flight snapshots, each with its own track: 2-8 gates
-    on a loop, horizontal normals against the travel direction, the drone
-    somewhere near the gate it is targeting."""
-    snaps = np.zeros((n, SNAP_FLOATS), dtype=np.float32)
-    tracks = np.zeros((n, TRACK_FLOATS), dtype=np.float32)
-    snaps[:, 0] = rng.uniform(0, 30, n)
-    for i in range(n):
-        n_gates = int(rng.integers(2, MAX_GATES + 1))
-        thetas = np.sort(rng.uniform(-np.pi, np.pi, n_gates))
-        radius = rng.uniform(1.0, 3.0)
-        gates = np.stack([radius * np.cos(thetas), radius * np.sin(thetas),
-                          rng.uniform(0.5, 1.5, n_gates)], axis=1)
-        travel = thetas + np.pi / 2 + rng.uniform(-0.3, 0.3, n_gates)
-        normals = -np.stack([np.cos(travel), np.sin(travel), np.zeros(n_gates)], axis=1)
-        idx = int(rng.integers(0, n_gates))
-        tracks[i, 0] = n_gates
-        tracks[i, 1:1 + 3 * n_gates] = gates.reshape(-1)
-        tracks[i, 1 + 3 * MAX_GATES:1 + 3 * MAX_GATES + 3 * n_gates] = normals.reshape(-1)
-        snaps[i, 18] = idx
-        snaps[i, 1:4] = gates[idx] + rng.uniform(-2.0, 2.0, 3)
-    q = rng.normal(size=(n, 4))
-    snaps[:, 4:8] = q / np.linalg.norm(q, axis=1, keepdims=True)
-    snaps[:, 8:11] = rng.uniform(-8.0, 8.0, (n, 3))                     # vel_w
-    snaps[:, 11:14] = rng.uniform(-600, 600, (n, 3))                    # gyro deg/s
-    snaps[:, 14:18] = rng.uniform(0.3, 1.4, (n, 4))                     # rpm / hover
-    return snaps, tracks
+def random_state(rng, near):
+    q = rng.normal(size=4)
+    return (near + rng.uniform(-2.0, 2.0, 3), q / np.linalg.norm(q), rng.uniform(-8.0, 8.0, 3),
+            rng.uniform(-600, 600, 3), rng.uniform(3000, 22000, 4))
 
 
 class Report:
@@ -211,119 +175,200 @@ class Report:
             self.failures.append(name)
 
 
-def check_blob(exe, blob, label, n, tmp, rep):
+def check_blob(lib, blob, label, n, rep):
     print(f"== {label}")
-    path = tmp / "slot.bin"
-    path.write_bytes(blob)
     H = nnpol_blob.parse(blob)
     rng = np.random.default_rng(0)
+    max_gates = lib.nnpolHostMaxGates()
 
     # 1. the slot validates and its identity is the digest of what flies
     rep.expect(f"slot validation ({H['name']!r}, {H['obs_dim']}-dim obs, layers {H['layer_dims']})",
-               status_of(exe, blob, tmp) == 0)
+               nnpol_core.slot_status(lib, blob)[0] == 0)
     rep.expect("identity words are the blob digest", H["hash_words"] == nnpol_blob.hash_words(blob))
 
-    # 2. network
-    obs = rng.uniform(-3, 3, (n, H["obs_dim"])).astype(np.float32)
-    act = run(exe, path, "policy", obs, 4)
-    rep.check("network vs numpy", np.abs(act - np.stack([np_forward(H, o) for o in obs])).max(), 2e-5)
+    with nnpol_core.Session(lib, blob) as s:
+        # 3. network
+        obs = rng.uniform(-3, 3, (n, H["obs_dim"])).astype(np.float32)
+        act = np.stack([s.forward(o) for o in obs])
+        rep.check("network vs numpy", np.abs(act - np.stack([np_forward(H, o) for o in obs])).max(), 2e-5)
 
-    # 3. observation
-    snaps, tracks = random_cases(rng, n)
-    both = np.concatenate([snaps, tracks], axis=1)
-    obs_c = run(exe, path, "obs", both, H["obs_dim"])
-    obs_np = np.stack([np_obs(s.astype(np.float64), t.astype(np.float64), H)
-                       for s, t in zip(snaps, tracks)])
-    rep.check("observation vs numpy transcription", np.abs(obs_c - obs_np).max(), 2e-4)
+        rep.expect("no command without a track", s.step(*random_state(rng, np.zeros(3))) is None)
 
-    # 4. gate state: positions drawn to land on every branch (approach side,
-    # crossing inside the square, crossing outside it, already past)
-    recs, expect = [], []
-    side = float(H["gate_side"])
-    for s, t in zip(snaps.astype(np.float64), tracks.astype(np.float64)):
-        n_gates, gates, normals = split_track(t)
-        idx = int(s[18])
-        n_vec = normals[idx]
-        tang = np.array([-n_vec[1], n_vec[0], 0.0])
-        pos = (gates[idx] - rng.uniform(-0.3, 0.3) * n_vec
-               + rng.uniform(-side, side) * tang + np.array([0, 0, rng.uniform(-side, side)]))
-        prev_x = rng.choice([1.0, 0.2, -0.1])
-        recs.append(np.concatenate([pos, [side, idx, prev_x], t]))
-        expect.append(np_update_gate((n_gates, gates, normals), side, pos, idx, prev_x))
-    out = run(exe, path, "gate", np.stack(recs), 2)
-    exp = np.array(expect)
-    rep.check("gate crossing test (index)", np.abs(out[:, 0] - exp[:, 0]).max(), 0.5)
-    rep.check("gate crossing test (prev x)", np.abs(out[:, 1] - exp[:, 1]).max(), 1e-4)
-    print("  [info] gate test: %d of %d records crossed" % (int((exp[:, 1] == 1.0).sum()), len(exp)))
+        # 4. one step on a fresh run: the first step never passes a gate, so
+        # the observation targets the track's first gate
+        e_obs = e_act = e_rpm = e_thrust = e_motor = 0.0
+        for _ in range(n):
+            track = random_track(rng, max_gates=max_gates)
+            assert s.set_context(track.context())[0] == 0
+            s.engage(THRUST_MAX, RPM_SCALE)
+            state = random_state(rng, track.pos[track.gate0])
+            out = s.step(*state)
+            ref_obs = np_obs(H, track, track.gate0, *state)
+            ref_act = np.clip(np_forward(H, ref_obs.astype(np.float32)), -1, 1)
+            rpm, thrust, motor = np_decode(out["act"].astype(np.float64), THRUST_MAX, RPM_SCALE, H)
+            e_obs = max(e_obs, np.abs(out["obs"][:H["obs_dim"]] - ref_obs).max())
+            e_act = max(e_act, np.abs(out["act"] - ref_act).max())
+            e_rpm = max(e_rpm, np.abs(out["rpm"] - rpm).max())
+            e_thrust = max(e_thrust, np.abs(out["thrust"] - thrust).max())
+            e_motor = max(e_motor, np.abs(out["motor"] - motor).max())
+        rep.check("observation vs numpy transcription", e_obs, 2e-4)
+        rep.check("clipped action end to end", e_act, 2e-4)
+        # rpm is O(1e4) with ~1e-3 rpm of float32 rounding; motor values are
+        # integers where rintf and np.rint can differ by one at an exact .5
+        rep.check("decode rpm", e_rpm, 0.05)
+        rep.check("decode thrust (N)", e_thrust, 2e-6)
+        rep.check("decode motor value", e_motor, 1.001)
+        hover_a = (np.zeros(4) if H["mixer"] == nnpol_blob.MIXER_ID["rpm_hover"]
+                   else np.full(4, 2.0 * H["hover_rpm"] / H["max_rpm"] - 1.0))
+        rpm, thrust, motor = np_decode(hover_a, THRUST_MAX, 1.0, H)
+        print("  [info] hover: %.0f rpm -> %.4f N per motor -> motor value %d of 65535"
+              % (rpm[0], thrust[0], motor[0]))
 
-    # 5. action decode. rpm columns are O(1e4) with ~1e-3 rpm of float32
-    # rounding; motor values are integers where rintf and np.rint can differ
-    # by one count at an exact .5 boundary.
-    acts = rng.uniform(-1.2, 1.2, (n, 4))               # beyond the box: the clip must match
-    tail = np.tile([THRUST_MAX, RPM_SCALE], (n, 1))
-    cmd_c = run(exe, path, "act", np.concatenate([acts, tail], axis=1), CMD_FLOATS)
-    cmd_np = np.stack([np_decode(a, THRUST_MAX, RPM_SCALE, H) for a in acts])
-    rep.check("decode rpm", np.abs(cmd_c[:, :4] - cmd_np[:, :4]).max(), 0.05)
-    rep.check("decode thrust (N)", np.abs(cmd_c[:, 4:8] - cmd_np[:, 4:8]).max(), 2e-6)
-    rep.check("decode motor value", np.abs(cmd_c[:, 8:] - cmd_np[:, 8:]).max(), 1.001)
-    hover = np_decode(np.zeros(4) if H["mixer"] == nnpol_blob.MIXER_ID["rpm_hover"]
-                      else np.full(4, 2.0 * H["hover_rpm"] / H["max_rpm"] - 1.0), THRUST_MAX, 1.0, H)
-    print("  [info] hover: %.0f rpm -> %.4f N per motor -> motor value %d of 65535"
-          % (hover[0], hover[4], hover[8]))
+        # 5a. gate state: two-step paths drawn to land on every branch
+        # (through the opening, through the plane outside it, short of the
+        # plane, backwards)
+        wrong, crossed = 0, 0
+        zeros = (np.array([1.0, 0, 0, 0]), np.zeros(3), np.zeros(3), np.full(4, 15000.0))
+        for _ in range(4 * n):
+            track = random_track(rng, max_gates=max_gates)
+            i = track.gate0
+            s.set_context(track.context())
+            s.engage(THRUST_MAX, RPM_SCALE)
 
-    # 6. end to end
-    full_c = run(exe, path, "full", np.concatenate([both, tail], axis=1), CMD_FLOATS)
-    full_np = np.stack([
-        np_decode(np.clip(np_forward(H, o.astype(np.float32)), -1, 1), THRUST_MAX, RPM_SCALE, H)
-        for o in obs_np])
-    rep.check("end-to-end rpm", np.abs(full_c[:, :4] - full_np[:, :4]).max(), 0.5)
-    rep.check("end-to-end motor value", np.abs(full_c[:, 8:] - full_np[:, 8:]).max(), 3.001)
+            def point(axial):
+                return (track.pos[i] + axial * track.normals[i]
+                        + rng.uniform(-track.side, track.side) * track.tangents[i]
+                        + rng.uniform(-track.side, track.side) * track.ups[i])
+            p0 = point(rng.choice([0.4, 0.05, -0.2]))
+            p1 = point(rng.choice([-0.3, -0.01, 0.2]))
+            s.step(p0, *zeros)
+            out = s.step(p1, *zeros)
+            idx, passed = track.update_gate(i, p0, p1)
+            crossed += passed
+            wrong += (out["gate_idx"] != idx) or (out["passed"] != passed)
+        rep.expect("gate crossing test on %d paths (%d passed)" % (4 * n, crossed), wrong == 0)
+
+        # 5b. whole laps: fly gate to gate through every opening
+        wrong, passes = 0, 0
+        for _ in range(20):
+            track = random_track(rng, n_gates=int(rng.integers(3, max_gates + 1)))
+            s.set_context(track.context())
+            s.engage(THRUST_MAX, RPM_SCALE)
+            idx = track.gate0
+            prev = None
+            for lap_gate in range(2 * track.n):
+                g = (track.gate0 + lap_gate) % track.n
+                for axial in (0.6, 0.2, -0.2, -0.6):
+                    p = (track.pos[g] + axial * track.normals[g]
+                         + rng.uniform(-0.3, 0.3) * track.side * track.tangents[g]
+                         + rng.uniform(-0.3, 0.3) * track.side * track.ups[g])
+                    out = s.step(p, *zeros)
+                    if prev is not None:
+                        idx, passed = track.update_gate(idx, prev, p)
+                        passes += passed
+                    prev = p
+                    wrong += out["gate_idx"] != idx
+        rep.expect("gate index over 20 two-lap flights (%d gates passed)" % passes,
+                   wrong == 0 and passes > 100)
 
 
-def check_refusals(exe, tmp, rep):
-    """Blobs the firmware must not select."""
+def check_refusals(lib, rep):
+    """Blobs and contexts the firmware must not adopt."""
     print("== refusals")
     rng = np.random.default_rng(1)
     good = bytearray(nnpol_blob.make_blob(nnpol_blob.random_layers(rng, 21)))
 
-    def patched(offset, fmt, value, fix_crc=True):
-        import struct
-        import zlib
+    def patched(offset, fmt, value):
         b = bytearray(good)
         struct.pack_into(fmt, b, offset, value)
-        if fix_crc:
-            struct.pack_into("<I", b, 12, zlib.crc32(bytes(b[16:])) & 0xFFFFFFFF)
+        struct.pack_into("<I", b, 12, zlib.crc32(bytes(b[16:])) & 0xFFFFFFFF)
         return bytes(b)
+
+    def status(blob):
+        return nnpol_core.slot_status(lib, blob)[0]
 
     flipped = bytearray(good)
     flipped[300] ^= 0x01
-    rep.expect("a flipped payload bit fails the CRC (status 5)", status_of(exe, bytes(flipped), tmp) == 5)
-    rep.expect("a setpoint action kind is refused (status 6)",
-               status_of(exe, patched(52, "<H", 1), tmp) == 6)
-    rep.expect("the retired attitude mixer is refused (status 6)",
-               status_of(exe, patched(54, "<H", 0), tmp) == 6)
-    rep.expect("an unknown activation is refused (status 4)",
-               status_of(exe, patched(38, "<H", 7), tmp) == 4)
-    rep.expect("an erased slot reads as empty (status 1)", status_of(exe, b"\xff" * 512, tmp) == 1)
+    rep.expect("a flipped payload bit fails the CRC (status 5)", status(bytes(flipped)) == 5)
+    rep.expect("a setpoint action kind is refused (status 6)", status(patched(52, "<H", 1)) == 6)
+    rep.expect("the retired attitude mixer is refused (status 6)", status(patched(54, "<H", 0)) == 6)
+    rep.expect("an unknown activation is refused (status 4)", status(patched(38, "<H", 7)) == 4)
+    rep.expect("an erased slot reads as empty (status 1)", status(b"\xff" * 512) == 1)
     wide = nnpol_blob.random_layers(rng, 21, hidden=(64, 64))
     wide[0] = (np.zeros((21, 200), np.float32), np.zeros(200, np.float32))
     wide[1] = (np.zeros((200, 64), np.float32), np.zeros(64, np.float32))
     rep.expect("a hidden layer over 128 wide is refused (status 4)",
-               status_of(exe, nnpol_blob.make_blob(wide), tmp) == 4)
+               status(nnpol_blob.make_blob(wide)) == 4)
+
+    max_gates = lib.nnpolHostMaxGates()
+    track = random_track(rng, n_gates=5)
+    ctx = bytearray(track.context())
+    with nnpol_core.Session(lib, bytes(good)) as s:
+        def ctx_status(c):
+            return s.set_context(bytes(c))[0]
+
+        def repacked(n=None, gate0=None, side=None, gates=None):
+            body = bytearray(ctx[8:])
+            if n is not None:
+                body[2] = n
+            if gate0 is not None:
+                body[3] = gate0
+            if side is not None:
+                struct.pack_into("<f", body, 4, side)
+            if gates is not None:
+                body[8:] = gates
+                struct.pack_into("<H", body, 0, 16 + len(gates))
+            return struct.pack("<II", nnpol_blob.CTX_MAGIC, zlib.crc32(bytes(body)) & 0xFFFFFFFF) + body
+
+        rep.expect("a track round-trips (status 0)", ctx_status(ctx) == 0)
+        full = random_track(rng, n_gates=max_gates)
+        rep.expect("a full %d-gate track is accepted" % max_gates, ctx_status(full.context()) == 0)
+        bad = bytearray(ctx)
+        bad[40] ^= 0x10
+        rep.expect("a flipped context bit fails the CRC (status 4)", ctx_status(bad) == 4)
+        rep.expect("half a context is refused", ctx_status(ctx[:len(ctx) // 2]) in (3, 4))
+        rep.expect("nothing written reads as empty (status 1)", ctx_status(b"\0" * 64) == 1)
+        rep.expect("a track with no gates is refused (status 5)",
+                   ctx_status(repacked(n=0, gates=b"")) == 5)
+        rep.expect("a first gate past the last is refused (status 5)", ctx_status(repacked(gate0=5)) == 5)
+        rep.expect("a zero gate side is refused (status 5)", ctx_status(repacked(side=0.0)) == 5)
+        gates = bytearray(ctx[16:])
+        struct.pack_into("<3f", gates, 12, 0.5, 0.0, 0.0)       # gate 0's normal, not a unit vector
+        rep.expect("a non-unit gate axis is refused (status 5)", ctx_status(repacked(gates=gates)) == 5)
+        rep.expect("a gate count the size does not match is refused (status 3)",
+                   ctx_status(repacked(n=4)) == 3)
+        over = struct.pack("<II", nnpol_blob.CTX_MAGIC, 0) + struct.pack(
+            "<HBBf", 16 + (max_gates + 1) * 48, max_gates + 1, 0, 1.0) + b"\0" * ((max_gates + 1) * 48)
+        rep.expect("more gates than the vehicle holds are refused (status 3)", ctx_status(over) == 3)
+    rep.expect("the writer refuses %d gates too" % (max_gates + 1), _raises(
+        lambda: nnpol_blob.make_context(*[np.zeros((max_gates + 1, 3))] * 4, 1.0)))
+    rep.expect("writer and library agree on the limits",
+               (nnpol_blob.MAX_GATES, nnpol_blob.CTX_MAX_BYTES, nnpol_blob.SLOT_BYTES,
+                nnpol_blob.MAX_OBS_DIM, nnpol_blob.MAX_HIDDEN, nnpol_blob.MAX_LAYERS)
+               == (max_gates, lib.nnpolHostContextMaxBytes(), lib.nnpolHostSlotBytes(),
+                   lib.nnpolHostMaxObsDim(), lib.nnpolHostMaxHidden(), lib.nnpolHostMaxLayers()))
+
+
+def _raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--blob", type=Path, default=None, help="check this blob instead of the synthetic set")
-    p.add_argument("--snapshots", type=int, default=300)
+    p.add_argument("--cases", type=int, default=200)
     args = p.parse_args()
 
-    tmp = Path(tempfile.mkdtemp(prefix="nnpol_parity_"))
-    exe = build(tmp)
+    lib = nnpol_core.load()
+    print("libnnpol_core: core version %d, %d gates" % (lib.nnpolHostVersion(), lib.nnpolHostMaxGates()))
     rep = Report()
 
     if args.blob is not None:
-        check_blob(exe, args.blob.read_bytes(), str(args.blob), args.snapshots, tmp, rep)
+        check_blob(lib, args.blob.read_bytes(), str(args.blob), args.cases, rep)
     else:
         rng = np.random.default_rng(0)
         cases = [
@@ -338,8 +383,8 @@ def main():
         for label, kwargs, obs_dim, hidden in cases:
             blob = nnpol_blob.make_blob(nnpol_blob.random_layers(rng, obs_dim, hidden),
                                         name=label[:40], **kwargs)
-            check_blob(exe, blob, label, args.snapshots, tmp, rep)
-        check_refusals(exe, tmp, rep)
+            check_blob(lib, blob, label, args.cases, rep)
+        check_refusals(lib, rep)
 
     if rep.failures:
         print("FAILED: " + ", ".join(rep.failures))

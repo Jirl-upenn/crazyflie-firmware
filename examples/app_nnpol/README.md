@@ -27,6 +27,10 @@ matching tag on `ros_quad_sim2real`.
 | (same commit) | latency flight (ROS `orpm-p3-latency-flight`) | straight passes at stepped speeds, compensation off then on; run the ROS calibration script on both bags | the off bag gives a stable `d0`; with `kalman.poseD0Ms` set, the on bag's slope is within 2 ms of zero (target) |
 | `orpm-p4-thrust-bench` | thrust bench, as flown so far (ROS `orpm-p4-thrust-bench`). PROPS ON, VEHICLE RESTRAINED | flash; run the ROS repo's `bin/bench/thrust_sweep.py --convention voltage` | the gain and offset of delivered against commanded rotor speed are on record for the per-motor path |
 | `orpm-p5-thrust-force` | thrust bench, force convention (ROS `orpm-p5-thrust-force`). PROPS ON, VEHICLE RESTRAINED | `python3 test/run_host_parity.py`; flash; `bin/bench/thrust_sweep.py --convention force` | delivered thrust tracks commanded within 5 % across the range (target), at a full and at a low battery |
+| `orpm-p6-policy-bench` | policy bench, props off (ROS `orpm-p6-policy-bench`) | `make -C test check`; flash; launch the ground station with a policy, then a second one | `nnpol.coreVer` matches the host library; each blob passes the launch parity gate, uploads, selects and reads back its hash; the track reads back in `nnpol.ctxCrc`; upload time recorded |
+| (same commit) | first onboard race, simplest flat track (ROS `orpm-p7-first-race`) | engage from a hover | onboard-versus-shadow action RMS below 5 % of the action range on all four channels; `nnpol.stale` = 0; onboard gate index = the ground station's at every gate |
+| (same commit) | policy switch (ROS `orpm-p8-policy-switch`) | fly one policy, hover, `set_policy`, fly a second | second engage passes hash readback and the parity criterion; no relaunch, no reflash |
+| (same commit) | race at speed with a dive gate (ROS `orpm-p9-dive-gate`) | a track with a pitched gate | gate indices agree through the dive gate; lap completes; parity criterion holds |
 
 ## Mocap latency compensation
 
@@ -92,8 +96,8 @@ Two limits follow: a commanded force above `THRUST_MAX` saturates, and below
 - On every policy tick (`nnpol.ctrlHz`, a writable param defaulting to the
   slot's trained rate; it must divide 1000 to run exactly, `nnpol.runHz`
   reports what engaged) the stabilizer snapshots EKF state, gyro and rotor
-  speeds on one tick, advances the gate state, and wakes the app task, which
-  builds the observation, runs the network and decodes the action. The
+  speeds on one tick and wakes the app task, which runs one policy step:
+  gate state, observation, network, decode. The
   stabilizer applies the latest complete action as a zero-order hold
   through the PID's per-motor bypass: no onboard controller runs while
   engaged.
@@ -112,10 +116,13 @@ Two limits follow: a commanded force above `THRUST_MAX` saturates, and below
 | `src/nnpol_slot_bank.c` | the flash slot bank: MEM_TYPE_APP upload handler, sector erase (watchdog widened), validity scan |
 | `src/nnpol_slot.h` / `nnpol_slot_format.c` | the blob format and its validation (pure C, host-testable) |
 | `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh, output map from the header (pure C) |
-| `src/nnpol_obs_race.c` | the race v3 observation and the gate-crossing test (pure C) |
+| `src/nnpol.h` / `nnpol_core.c` | one policy step end to end, `nnpolCoreStep`: gate state, observation, network, clip, decode. The app task and the host library both run it (pure C) |
+| `src/nnpol_obs_race.c` | the race v3 observation, the gate-crossing test in the gate's own frame, and the engage context parser (pure C) |
 | `src/nnpol_action.c` | the rpm family's decode: action map, rpm_scale, rotor speed to motor value (pure C) |
-| `test/nnpol_blob.py` | the blob format in Python: reference writer and parser |
-| `test/` | host parity harness (plain gcc) + python runner |
+| `test/nnpol_blob.py` | the slot blob and the engage context in Python: reference writers and parser |
+| `test/nnpol_host.c`, `test/Makefile` | `libnnpol_core.so`: the pure-C core for the host, with a flat entry point |
+| `test/nnpol_core.py` | ctypes loader for the library (the ground station's parity gate imports it) |
+| `test/run_host_parity.py` | the host parity suite |
 
 ## Slot protocol (what the ground station does)
 
@@ -145,27 +152,59 @@ The image must end below `0x08060000` (sector 7): ~309 KB today against a
 368 KB ceiling (the bootloader takes the first 16 KB). `nnpolSlotBankInit`
 checks this at boot and disables the slot bank if the image overlaps it. Check the size line of the build before growing the firmware.
 
-## Host parity
+## Engage context (the track)
+
+The track is fixed in the mocap frame and belongs to the run, not to the
+checkpoint. The ground station writes it as one checksummed blob into the
+app's memory right after the slot bank (`MEM_TYPE_APP`, offset
+`5 * 131072`; RAM, so it may be written while hovering, but never under an
+engaged policy):
 
 ```
-python3 test/run_host_parity.py            # synthetic blobs, no run directory needed
+u32 magic "NPC1" | u32 crc32 over bytes [8, total) | u16 total |
+u8 nGates | u8 gate0 | f32 gateSide |
+nGates x { f32 pos[3], normal[3], tangent[3], up[3] }
+```
+
+Each gate carries its whole frame, so pitched (dive) gates are scored in
+their own plane. `gateSide` is the PHYSICAL gate's opening, not the trained
+one. Up to 24 gates (`nnpol.maxGates`). The app task parses it while nothing
+is engaged; `nnpol.ctxStatus` (0 = ok) and `nnpol.ctxCrc` (the blob's CRC
+once validated) are the readback. **`nnpol.enable` is ignored without a
+validated context.**
+
+The gate advances when the segment between two consecutive policy-step
+positions crosses the target gate's plane from the approach side inside the
+opening - the trainer's `plane_crossings` test, as the ground station's
+`RaceV3._update_gate` runs it.
+
+## Host library and parity
+
+```
+make -C test                 # test/build/libnnpol_core.so
+make -C test check           # ... and the parity suite (needs numpy)
 python3 test/run_host_parity.py --blob policy_slot.bin
 ```
 
-Compiles the flight observation / action / interpreter C with host gcc,
-loads a blob exactly as a flash slot, validates it, and checks the network,
-the observation, the gate test and the decode against numpy transcriptions
-of the host path. Needs numpy.
+`libnnpol_core.so` is the same C the firmware compiles, and
+`nnpolCoreStep` is the function the app task calls. The suite steps it on
+synthetic blobs and random tracks and compares every stage - validation,
+context, network, observation, gate state, decode - with numpy
+transcriptions of the host path. The ground station loads the same library
+at launch and compares it with its own policy before uploading anything;
+`nnpolHostVersion()` must equal the vehicle's `nnpol.coreVer`
+(`NNPOL_CORE_VERSION` in `nnpol.h`: bump it whenever the blob, the context
+or a step's result changes).
 
 ## Param / log reference
 
-Params (`nnpol.`): `enable` (u8, the engage switch); `nGates`, `gate0`,
-`g0x..g7nz` (the track), `rpmScale`, `ctrlHz` (policy rate,
-default = the slot's trained rate) — all latched at the `enable` rising
-edge; `slot` (select), `slotErase`; read-only: `slotSel`, `slotState`,
+Params (`nnpol.`): `enable` (u8, the engage switch); `rpmScale`, `ctrlHz`
+(policy rate, default = the slot's trained rate) — latched at the `enable`
+rising edge; `slot` (select), `slotErase`; read-only: `slotSel`, `slotState`,
 `slotStatus`, `slotValid`, `nSlots`, `writeSlot`, `writtenBytes`, `runHz`,
 the selected slot's identity `hash0-3`, `obsDim`, `actDim`, `kind`,
-`taskId`, and the build's thrust convention `batComp` (1 = motor values are
+`taskId`, the engage context's `ctxStatus` / `ctxCrc`, the limits and
+version `maxGates` / `coreVer`, and the build's thrust convention `batComp` (1 = motor values are
 forces, battery compensated) and `thrustMax` (N per motor at 65535).
 `benchPwm` (u16): the bench sweep's motor value, applied to all four motors
 while armed and not engaged, for 300 ms after each write.

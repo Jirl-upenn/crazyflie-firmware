@@ -51,12 +51,10 @@
 #define NNPOL_TASK_UNSUPPORTED 0xFFFF  /* exported, uploadable, but cannot engage */
 /* task[] indices (the exporter's slot_task); 0..5 are unused by the race task. */
 #define NNPOL_TASK_MOTOROBS 6          /* != 0: append 4 normalized rotor speeds */
-#define NNPOL_TASK_GATE_SIDE 7         /* RACE: gate side length, m (the crossing square) */
-#define NNPOL_MAX_GATES 8              /* RACE: the pushed track's capacity */
-/* Rotor-speed normalizer of the motorobs observations: the trainer's
- * NOMINAL_HOVER_RPM (every tasks package: 15896.3; crazyflie-ros TaskObs). */
-#define NNPOL_NOMINAL_HOVER_RPM 15896.296489245326f
-
+#define NNPOL_TASK_GATE_SIDE 7         /* RACE: the TRAINED gate side, m. Informational: the
+                                          crossing test scores against the physical gate
+                                          the host pushes with the track */
+#define NNPOL_MAX_GATES 24             /* RACE: the pushed track's capacity */
 /* Interpreter limits: a header outside these fails validation. */
 #define NNPOL_MAX_OBS_DIM 64
 #define NNPOL_MAX_HIDDEN 128

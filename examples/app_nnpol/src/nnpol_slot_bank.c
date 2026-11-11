@@ -35,6 +35,7 @@
 #include "supervisor.h"
 #include "watchdog.h"
 
+#include "nnpol.h"
 #include "nnpol_slot_bank.h"
 
 static uint8_t validMask = 0;
@@ -43,6 +44,22 @@ static volatile bool bankLocked = false;
 static bool bankEnabled = false; /* false until nnpolSlotBankInit finds the image clear of the bank */
 static uint8_t writeSlot = NNPOL_SLOT_NONE;
 static uint32_t writtenBytes = 0;
+
+/* The engage context as the radio left it: plain RAM, validated by the app
+ * task before use. Word-aligned so the parser may be handed it directly. */
+static uint8_t ctxStaged[NNPOL_CTX_MAX_BYTES] __attribute__((aligned(4)));
+static volatile uint32_t ctxWriteCount = 0;
+static volatile bool ctxLocked = false;
+
+const uint8_t* nnpolContextStaged(uint32_t* writeCount)
+{
+  if (writeCount != NULL) {
+    *writeCount = ctxWriteCount;
+  }
+  return ctxStaged;
+}
+
+void nnpolContextSetLocked(bool locked) { ctxLocked = locked; }
 
 static uint32_t slotAddress(uint8_t slot)
 {
@@ -136,13 +153,20 @@ bool nnpolSlotBankErase(uint8_t slot)
 static uint32_t handleMemGetSize(const uint8_t internal_id)
 {
   (void)internal_id;
-  return NNPOL_NUM_SLOTS * NNPOL_SLOT_BYTES;
+  return NNPOL_CTX_MEM_OFFSET + NNPOL_CTX_MAX_BYTES;
 }
 
 static bool handleMemRead(const uint8_t internal_id, const uint32_t memAddr,
                           const uint8_t readLen, uint8_t* buffer)
 {
   (void)internal_id;
+  if (memAddr >= NNPOL_CTX_MEM_OFFSET) {
+    if (memAddr + readLen > NNPOL_CTX_MEM_OFFSET + NNPOL_CTX_MAX_BYTES) {
+      return false;
+    }
+    memcpy(buffer, ctxStaged + (memAddr - NNPOL_CTX_MEM_OFFSET), readLen);
+    return true;
+  }
   if (memAddr + readLen > NNPOL_NUM_SLOTS * NNPOL_SLOT_BYTES) {
     return false;
   }
@@ -154,6 +178,16 @@ static bool handleMemWrite(const uint8_t internal_id, const uint32_t memAddr,
                            const uint8_t writeLen, const uint8_t* buffer)
 {
   (void)internal_id;
+  if (memAddr >= NNPOL_CTX_MEM_OFFSET) {
+    /* The engage context: RAM, any alignment, allowed in the air - but
+     * never under an engaged policy. */
+    if (ctxLocked || memAddr + writeLen > NNPOL_CTX_MEM_OFFSET + NNPOL_CTX_MAX_BYTES) {
+      return false;
+    }
+    memcpy(ctxStaged + (memAddr - NNPOL_CTX_MEM_OFFSET), buffer, writeLen);
+    ctxWriteCount++;
+    return true;
+  }
   if (!writesAllowed()) {
     return false;
   }
