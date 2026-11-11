@@ -9,7 +9,17 @@
  *                hover-anchored segments per motor) or rpm_direct (one line
  *                through [0, max_rpm])
  *   rpm_scale    the host's hover-point calibration knob (nnpol.rpmScale)
- *   rpm_to_pwm   vmotor2rpm inverted at vnom, np.rint, clip to [0, 65535]
+ *   thrust       the rotor speed as a force, by the drone's thrust curve
+ *   motor value  that force as a fraction of the build's THRUST_MAX
+ *
+ * THE MOTOR VALUE IS A FORCE, NOT A PWM RATIO. With
+ * CONFIG_ENABLE_THRUST_BAT_COMPENSATED (required here) the firmware reads
+ * every 16-bit motor value as value / 65535 x THRUST_MAX newtons and turns
+ * it into a motor voltage at the measured battery voltage. Sending a voltage
+ * fraction instead - what the host and this app did before - inverts the
+ * motor curve twice: delivered thrust came out near 0.53 x commanded +
+ * 0.17 N on the October flights. Sending the force makes the delivered
+ * thrust independent of battery voltage, as training assumes.
  *
  * Every constant comes from the slot header (map anchors, the drone's
  * motor identification), so one build serves every rpm-family checkpoint.
@@ -27,15 +37,23 @@ static float clip1(float v)
   return v;
 }
 
-/* Per-motor rpm -> 16-bit ratio at the pushed nominal voltage: the host's
- * rpm_to_pwm (controller_motor_policy.py), np.rint then clip. */
-static float rpmToPwm(const nnpolSlotHeader_t* h, float rpm, float vnom)
+/* Per-motor rotor speed -> force, by the drone's thrust curve (crazyflow
+ * rpm2thrust: f = a0 + a1 rpm + a2 rpm^2, the curve the simulator turns a
+ * commanded rotor speed into force with). */
+static float rpmToThrust(const nnpolSlotHeader_t* h, float rpm)
 {
-  const float vMotor = (rpm - h->vmotor2rpm[0]) / h->vmotor2rpm[1];
-  float pwm = rintf(65535.0f * vMotor / vnom);
-  if (pwm < 0.0f) { pwm = 0.0f; }
-  if (pwm > 65535.0f) { pwm = 65535.0f; }
-  return pwm;
+  const float f = h->rpm2thrust[0] + (h->rpm2thrust[1] + h->rpm2thrust[2] * rpm) * rpm;
+  return f > 0.0f ? f : 0.0f;
+}
+
+/* Force -> the 16-bit motor value: the fraction of thrustMax, np.rint, clip.
+ * A force beyond thrustMax saturates here, as the motor would. */
+static float thrustToMotor(float thrust, float thrustMax)
+{
+  float value = rintf(65535.0f * thrust / thrustMax);
+  if (value < 0.0f) { value = 0.0f; }
+  if (value > 65535.0f) { value = 65535.0f; }
+  return value;
 }
 
 /* _RpmHoverAdapter: two hover-anchored segments, action 0 = exact hover. */
@@ -63,7 +81,7 @@ static void mixer(const nnpolSlotHeader_t* h, const float a[NNPOL_ACTION_DIM], f
 }
 
 void nnpolDecodeAction(const nnpolSlotHeader_t* h, const float action[NNPOL_ACTION_DIM],
-                       float vnom, float rpmScale, nnpolCmd_t* out)
+                       float thrustMax, float rpmScale, nnpolCmd_t* out)
 {
   memset(out, 0, sizeof(*out));
   float a[NNPOL_ACTION_DIM];
@@ -74,6 +92,7 @@ void nnpolDecodeAction(const nnpolSlotHeader_t* h, const float action[NNPOL_ACTI
   mixer(h, a, rpm);
   for (int i = 0; i < 4; i++) {
     out->rpm[i] = rpm[i] * rpmScale;
-    out->motorPwm[i] = rpmToPwm(h, out->rpm[i], vnom);
+    out->thrust[i] = rpmToThrust(h, out->rpm[i]);
+    out->motorPwm[i] = thrustToMotor(out->thrust[i], thrustMax);
   }
 }

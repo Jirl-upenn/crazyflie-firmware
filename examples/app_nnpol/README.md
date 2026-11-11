@@ -26,6 +26,7 @@ matching tag on `ros_quad_sim2real`.
 | (same commit) | hover, compensation off then on | hover on the SE3 cascade with `kalman.poseComp` 0, then 1 (driver config `pose_delay_comp`) | no change in hover position or heading error between the two; no rate warnings |
 | (same commit) | latency flight (ROS `orpm-p3-latency-flight`) | straight passes at stepped speeds, compensation off then on; run the ROS calibration script on both bags | the off bag gives a stable `d0`; with `kalman.poseD0Ms` set, the on bag's slope is within 2 ms of zero (target) |
 | `orpm-p4-thrust-bench` | thrust bench, as flown so far (ROS `orpm-p4-thrust-bench`). PROPS ON, VEHICLE RESTRAINED | flash; run the ROS repo's `bin/bench/thrust_sweep.py --convention voltage` | the gain and offset of delivered against commanded rotor speed are on record for the per-motor path |
+| `orpm-p5-thrust-force` | thrust bench, force convention (ROS `orpm-p5-thrust-force`). PROPS ON, VEHICLE RESTRAINED | `python3 test/run_host_parity.py`; flash; `bin/bench/thrust_sweep.py --convention force` | delivered thrust tracks commanded within 5 % across the range (target), at a full and at a low battery |
 
 ## Mocap latency compensation
 
@@ -53,6 +54,23 @@ branch:
 
 Logs (`kalman.`): `poseAgeMs` (total age applied), `poseHostMs` (the
 packet's part), `poseDrop`, `poseResX/Y/Z` (position residual as applied).
+
+## Motor values are forces
+
+The firmware passes every 16-bit motor value, on every control path, through
+`motorsCompensateBatteryVoltage`: the value is read as a force, value / 65535
+× `THRUST_MAX` (0.2 N per motor on the brushless platform), and turned into a
+motor voltage at the measured battery voltage. From `orpm-p5-thrust-force`
+on, the app sends exactly that: rotor speed → force by the drone's thrust
+curve (the slot header's `rpm2thrust`) → fraction of `THRUST_MAX`. Before it,
+the app and the host sent a voltage fraction, which the firmware then
+inverted a second time (about 0.53 × commanded + 0.17 N delivered on the
+October CTBR flights). The build refuses to compile without
+`CONFIG_ENABLE_THRUST_BAT_COMPENSATED`, and reports `nnpol.batComp` /
+`nnpol.thrustMax` so the ground station can check what it is talking to.
+
+Two limits follow: a commanded force above `THRUST_MAX` saturates, and below
+`THRUST_MIN` (0.021 N) the firmware commands idle.
 
 ## What it does
 
@@ -142,7 +160,7 @@ of the host path. Needs numpy.
 ## Param / log reference
 
 Params (`nnpol.`): `enable` (u8, the engage switch); `nGates`, `gate0`,
-`g0x..g7nz` (the track), `vnom` (V), `rpmScale`, `ctrlHz` (policy rate,
+`g0x..g7nz` (the track), `rpmScale`, `ctrlHz` (policy rate,
 default = the slot's trained rate) — all latched at the `enable` rising
 edge; `slot` (select), `slotErase`; read-only: `slotSel`, `slotState`,
 `slotStatus`, `slotValid`, `nSlots`, `writeSlot`, `writtenBytes`, `runHz`,

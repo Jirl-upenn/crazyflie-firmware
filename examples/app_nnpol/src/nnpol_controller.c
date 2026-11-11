@@ -107,7 +107,6 @@
 // --------------------------------------------------------------------------
 
 static uint8_t nnpolEnable = 0;
-static float paramVnom = 4.0f;      /* same fixed voltage the host maps thrust at */
 static float paramRpmScale = 1.0f;  /* MOTOR kind: the host's motor_pwm.rpm_scale */
 /* Latched from the param at the enable rising edge, so a mid-run param
  * write cannot rescale the motors; read by the app task. */
@@ -131,17 +130,16 @@ static uint8_t logGateIdx = 0;
 
 /* Thrust convention of this build, read-only, so the ground station can
  * refuse a vehicle whose motor values mean something else than it sends.
- * With CONFIG_ENABLE_THRUST_BAT_COMPENSATED every 16-bit motor value - the
- * per-motor path included - is read by motorsCompensateBatteryVoltage as a
- * FORCE, value / 65535 x THRUST_MAX newtons, and turned into a motor voltage
- * at the measured battery voltage. Without it the value is the PWM ratio. */
-#ifdef CONFIG_ENABLE_THRUST_BAT_COMPENSATED
+ * motorsCompensateBatteryVoltage reads every 16-bit motor value - the
+ * per-motor path included - as a FORCE, value / 65535 x THRUST_MAX newtons,
+ * and turns it into a motor voltage at the measured battery voltage. The
+ * app's decode (nnpol_action.c) sends exactly that, so the build must
+ * compensate. */
+#ifndef CONFIG_ENABLE_THRUST_BAT_COMPENSATED
+#error "app_nnpol sends motor values as forces: build with CONFIG_ENABLE_THRUST_BAT_COMPENSATED"
+#endif
 static uint8_t paramBatComp = 1;
 static float paramThrustMax = THRUST_MAX;
-#else
-static uint8_t paramBatComp = 0;
-static float paramThrustMax = 0.0f;
-#endif
 
 /* Bench sweep (props on, vehicle restrained): one 16-bit value applied to all
  * four motors through the same per-motor path a policy's action takes, while
@@ -327,7 +325,7 @@ static uint32_t actionRead(nnpolCmd_t* out)
 
 static float logT;
 static float logAct[NNPOL_ACTION_DIM];      /* clipped network output */
-static uint16_t logPwm[4];                  /* the decoded per-motor PWM */
+static uint16_t logPwm[4];                  /* the decoded 16-bit motor value */
 static float logVb[3], logWb[3], logE0[3];  /* obs excerpts */
 static uint16_t logUs;                      /* inference microseconds */
 static uint16_t logStale;                   /* periods spent >= stale threshold */
@@ -407,7 +405,7 @@ void appMain()
     }
 
     nnpolCmd_t cmd;
-    nnpolDecodeAction(activePolicy.hdr, act, paramVnom, activeRpmScale, &cmd);
+    nnpolDecodeAction(activePolicy.hdr, act, THRUST_MAX, activeRpmScale, &cmd);
 
     const uint64_t elapsed = usecTimestamp() - tStart;
 
@@ -689,9 +687,7 @@ PARAM_ADD(PARAM_FLOAT, g7z, &paramGates[7][2])
 PARAM_ADD(PARAM_FLOAT, g7nx, &paramGates[7][3])
 PARAM_ADD(PARAM_FLOAT, g7ny, &paramGates[7][4])
 PARAM_ADD(PARAM_FLOAT, g7nz, &paramGates[7][5])
-/** @brief Battery voltage every thrust/rpm-to-PWM map assumes (host parity). */
-PARAM_ADD(PARAM_FLOAT, vnom, &paramVnom)
-/** @brief rpm multiplier before the PWM map (host motor_pwm.rpm_scale). */
+/** @brief rpm multiplier before the thrust map (host motor_pwm.rpm_scale). */
 PARAM_ADD(PARAM_FLOAT, rpmScale, &paramRpmScale)
 /** @brief Policy rate (Hz) latched at the enable rising edge. Defaults to
  * the selected slot's trained ctrl_freq; must divide 1000 to run exactly. */
@@ -732,10 +728,9 @@ PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, kind, &paramKind)
 /** @brief Observation builder of the selected slot (2 = race v3). */
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, taskId, &paramTaskId)
 /** @brief 1 = this build reads every 16-bit motor value as a force and
- * compensates for battery voltage (CONFIG_ENABLE_THRUST_BAT_COMPENSATED). */
+ * compensates for battery voltage (always, on this branch). */
 PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, batComp, &paramBatComp)
-/** @brief The force a motor value of 65535 stands for, N per motor; 0 when
- * the build does not compensate. */
+/** @brief The force a motor value of 65535 stands for, N per motor. */
 PARAM_ADD(PARAM_FLOAT | PARAM_RONLY, thrustMax, &paramThrustMax)
 /** @brief Bench sweep: a 16-bit value applied to all four motors while armed
  * and not engaged, held for 300 ms after each write. PROPS ON, RESTRAINED. */
@@ -754,7 +749,7 @@ LOG_ADD(LOG_FLOAT, act0, &logAct[0])
 LOG_ADD(LOG_FLOAT, act1, &logAct[1])
 LOG_ADD(LOG_FLOAT, act2, &logAct[2])
 LOG_ADD(LOG_FLOAT, act3, &logAct[3])
-/** @brief The decoded per-motor PWM M1..M4. */
+/** @brief The decoded 16-bit motor value M1..M4 (a force, see thrustMax). */
 LOG_ADD(LOG_UINT16, pwm0, &logPwm[0])
 LOG_ADD(LOG_UINT16, pwm1, &logPwm[1])
 LOG_ADD(LOG_UINT16, pwm2, &logPwm[2])

@@ -59,9 +59,10 @@ typedef struct {
 
 /** One decoded command, every stage kept for logging and host parity. */
 typedef struct {
-  float rpm[4];          /**< mixer output x rpmScale, M1..M4 */
-  float motorPwm[4];     /**< 0..65535 per motor, rounded as the host's
-                              rpm_to_pwm rounds (np.rint) */
+  float rpm[4];          /**< action map output x rpmScale, M1..M4 */
+  float thrust[4];       /**< the force that rotor speed stands for, N per motor */
+  float motorPwm[4];     /**< the 16-bit motor value: thrust / thrustMax x 65535,
+                              rounded as the host rounds (np.rint), clipped */
 } nnpolCmd_t;
 
 /** A validated slot: its header and the weights behind it. */
@@ -92,12 +93,12 @@ int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolRaceTrack_t* track,
  * -> act[4], the RAW (unsquashed) mean — the caller clips to [-1, 1]. */
 void nnpolForward(const nnpolPolicy_t* p, const float* obs, float act[NNPOL_ACTION_DIM]);
 
-/** Clipped action in [-1, 1]^4 -> per-motor rotor speed and PWM, through
- * the header's mixer. `vnom` is the battery voltage the rpm-to-PWM map
- * assumes (nnpol.vnom, pushed at engage — the same fixed voltage the host
- * uses, for shadow parity); `rpmScale` is the hover-point calibration knob
- * (nnpol.rpmScale, the host's motor_pwm.rpm_scale). */
+/** Clipped action in [-1, 1]^4 -> per-motor rotor speed, force and motor
+ * value. `thrustMax` is the force a motor value of 65535 stands for in this
+ * build (THRUST_MAX, N per motor): the firmware reads the value as a force
+ * and compensates for battery voltage itself. `rpmScale` is the hover-point
+ * calibration knob (nnpol.rpmScale, the host's motor_pwm.rpm_scale). */
 void nnpolDecodeAction(const nnpolSlotHeader_t* hdr, const float action[NNPOL_ACTION_DIM],
-                       float vnom, float rpmScale, nnpolCmd_t* out);
+                       float thrustMax, float rpmScale, nnpolCmd_t* out);
 
 #endif /* NNPOL_H */

@@ -19,7 +19,8 @@ of what would hurt most in the air:
      RaceV3MotorObs.observe.
   4. gate state - the crossing test against its numpy transcription.
   5. action-decode parity - random actions through nnpolDecodeAction against
-     a numpy transcription of the host's MotorPwmRacingPolicy.decode.
+     a numpy transcription of the host's MotorPwmRacingPolicy.decode: action
+     map, thrust curve, motor value as a fraction of THRUST_MAX.
   6. end to end - snapshot -> obs -> network -> clip -> decode in one C pass
      against the same chain in numpy.
 
@@ -47,8 +48,8 @@ import nnpol_blob  # noqa: E402
 MAX_GATES = 8
 SNAP_FLOATS = 19                    # test_policy_host.c
 TRACK_FLOATS = 1 + 6 * MAX_GATES
-CMD_FLOATS = 8
-VNOM = 4.0
+CMD_FLOATS = 12
+THRUST_MAX = 0.2                    # platform_defaults_cf21bl.h, N per motor
 RPM_SCALE = 1.0
 C_SOURCES = ("nnpol_slot_format.c", "nnpol_policy.c", "nnpol_obs_race.c", "nnpol_action.c")
 
@@ -125,10 +126,16 @@ def np_update_gate(track, gate_side, pos, gate_idx, prev_gate_x):
     return gate_idx, x
 
 
-def np_rpm_to_pwm(rpm, vnom, H):
-    k0, k1 = H["vmotor2rpm"]
-    v = (np.asarray(rpm, dtype=np.float64) - k0) / k1
-    return np.clip(np.rint(65535.0 * v / vnom), 0, 65535)
+def np_rpm_to_thrust(rpm, H):
+    """crazyflow rpm2thrust: the force the simulator gives a rotor speed."""
+    a0, a1, a2 = H["rpm2thrust"]
+    rpm = np.asarray(rpm, dtype=np.float64)
+    return np.maximum(a0 + a1 * rpm + a2 * rpm * rpm, 0.0)
+
+
+def np_thrust_to_motor(thrust, thrust_max):
+    """The 16-bit motor value: the force as a fraction of the build's THRUST_MAX."""
+    return np.clip(np.rint(65535.0 * np.asarray(thrust) / thrust_max), 0, 65535)
 
 
 def np_mix(a, H):
@@ -139,12 +146,13 @@ def np_mix(a, H):
     return np.where(a <= 0, (a + 1.0) * hover, hover + (max_rpm - hover) * a)
 
 
-def np_decode(action, vnom, rpm_scale, H):
+def np_decode(action, thrust_max, rpm_scale, H):
     a = np.clip(action, -1, 1)
     out = np.zeros(CMD_FLOATS)
     rpm = np_mix(a, H) * rpm_scale
     out[0:4] = rpm
-    out[4:8] = np_rpm_to_pwm(rpm, vnom, H)
+    out[4:8] = np_rpm_to_thrust(rpm, H)
+    out[8:12] = np_thrust_to_motor(out[4:8], thrust_max)
     return out
 
 
@@ -249,22 +257,27 @@ def check_blob(exe, blob, label, n, tmp, rep):
     print("  [info] gate test: %d of %d records crossed" % (int((exp[:, 1] == 1.0).sum()), len(exp)))
 
     # 5. action decode. rpm columns are O(1e4) with ~1e-3 rpm of float32
-    # rounding; PWM columns are integers where rintf and np.rint can differ by
-    # one count at an exact .5 boundary.
+    # rounding; motor values are integers where rintf and np.rint can differ
+    # by one count at an exact .5 boundary.
     acts = rng.uniform(-1.2, 1.2, (n, 4))               # beyond the box: the clip must match
-    tail = np.tile([VNOM, RPM_SCALE], (n, 1))
+    tail = np.tile([THRUST_MAX, RPM_SCALE], (n, 1))
     cmd_c = run(exe, path, "act", np.concatenate([acts, tail], axis=1), CMD_FLOATS)
-    cmd_np = np.stack([np_decode(a, VNOM, RPM_SCALE, H) for a in acts])
+    cmd_np = np.stack([np_decode(a, THRUST_MAX, RPM_SCALE, H) for a in acts])
     rep.check("decode rpm", np.abs(cmd_c[:, :4] - cmd_np[:, :4]).max(), 0.05)
-    rep.check("decode pwm", np.abs(cmd_c[:, 4:] - cmd_np[:, 4:]).max(), 1.001)
+    rep.check("decode thrust (N)", np.abs(cmd_c[:, 4:8] - cmd_np[:, 4:8]).max(), 2e-6)
+    rep.check("decode motor value", np.abs(cmd_c[:, 8:] - cmd_np[:, 8:]).max(), 1.001)
+    hover = np_decode(np.zeros(4) if H["mixer"] == nnpol_blob.MIXER_ID["rpm_hover"]
+                      else np.full(4, 2.0 * H["hover_rpm"] / H["max_rpm"] - 1.0), THRUST_MAX, 1.0, H)
+    print("  [info] hover: %.0f rpm -> %.4f N per motor -> motor value %d of 65535"
+          % (hover[0], hover[4], hover[8]))
 
     # 6. end to end
     full_c = run(exe, path, "full", np.concatenate([both, tail], axis=1), CMD_FLOATS)
     full_np = np.stack([
-        np_decode(np.clip(np_forward(H, o.astype(np.float32)), -1, 1), VNOM, RPM_SCALE, H)
+        np_decode(np.clip(np_forward(H, o.astype(np.float32)), -1, 1), THRUST_MAX, RPM_SCALE, H)
         for o in obs_np])
     rep.check("end-to-end rpm", np.abs(full_c[:, :4] - full_np[:, :4]).max(), 0.5)
-    rep.check("end-to-end pwm", np.abs(full_c[:, 4:] - full_np[:, 4:]).max(), 2.001)
+    rep.check("end-to-end motor value", np.abs(full_c[:, 8:] - full_np[:, 8:]).max(), 3.001)
 
 
 def check_refusals(exe, tmp, rep):

@@ -14,15 +14,15 @@
  *   info   : prints "status obsDim actionDim numLayers kind mixer taskId ctrlHz"
  *   policy : obs[obsDim]                          -> act[4]   (raw, unclipped)
  *   obs    : snapshot[SNAP], track[TRACK]         -> obs[obsDim]
- *   act    : action[4], vnom, rpmScale            -> cmd[8]
- *   full   : snapshot[SNAP], track[TRACK], vnom, rpmScale
- *                                                 -> cmd[8]   (obs -> net -> clip -> decode)
+ *   act    : action[4], thrustMax, rpmScale       -> cmd[12]
+ *   full   : snapshot[SNAP], track[TRACK], thrustMax, rpmScale
+ *                                                 -> cmd[12]  (obs -> net -> clip -> decode)
  *   gate   : pos(3), gateSide, gateIdx, prevGateX, track[TRACK]
  *                                                 -> [gateIdx, prevGateX] (one crossing-test step)
  *
  * snapshot[19] = [t, pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), rpm_norm(4), gateIdx]
  * track[49]    = [nGates, gates(8 x 3), normals(8 x 3)]
- * cmd[8]       = [rpm(4), motorPwm(4)]   — nnpolCmd_t flattened
+ * cmd[12]      = [rpm(4), thrust(4), motorPwm(4)]   — nnpolCmd_t flattened
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +32,7 @@
 
 #define SNAP_FLOATS 19
 #define TRACK_FLOATS (1 + 6 * NNPOL_MAX_GATES)
-#define CMD_FLOATS 8
+#define CMD_FLOATS 12
 #define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 2)
 #define SLOT_CAPACITY 0x20000u
 
@@ -61,7 +61,8 @@ static void unpackTrack(const float* in, nnpolRaceTrack_t* t)
 static void packCmd(const nnpolCmd_t* c, float* out)
 {
   memcpy(out, c->rpm, 4 * sizeof(float));
-  memcpy(out + 4, c->motorPwm, 4 * sizeof(float));
+  memcpy(out + 4, c->thrust, 4 * sizeof(float));
+  memcpy(out + 8, c->motorPwm, 4 * sizeof(float));
 }
 
 static void clipAction(float* act)
