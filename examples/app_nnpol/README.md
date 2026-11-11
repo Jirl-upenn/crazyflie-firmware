@@ -1,81 +1,59 @@
-# app_nnpol — onboard neural-network policy (out-of-tree controller)
+# app_nnpol — onboard racing policy (out-of-tree controller)
 
-Runs a trained actor network on the Crazyflie's STM32F405 instead of on
-the ground station, at the policy's control rate, from a policy the ground
-station uploaded over the radio into one of five flash slots. Design and
-validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
+Branch `onboard-rpm`. Runs a trained actor network on the Crazyflie's
+STM32F405 at the policy's control rate, from a policy the ground station
+uploaded over the radio into one of five flash slots. The vehicle builds
+the observation from its own EKF and gyro, runs the network and drives the
+motors; the ground station (`ros_quad_sim2real`, branch `onboard-rpm`)
+forwards mocap, manages policies and supervises.
+
+Scope: the `race` task with the `v3` / `v3_motorobs` observation, and the
+rpm action family (`rpm_hover`, `rpm_direct`). Trajectory tracking, the
+setpoint action types and offboard policy execution are not on this branch
+(see `nnpol` and `onboard_only`).
+
+## Test ladder
+
+Every row is ONE commit on this branch, tagged. To run a phase, check out
+its tag, build, flash, and do what the row says; do not climb past a row
+that fails. Host tests apply at every commit. Rows marked "ROS" need the
+matching tag on `ros_quad_sim2real`.
+
+| tag | phase | what to do | go |
+|---|---|---|---|
+| `orpm-p0-baseline` | host tests, and nothing changed in the air | `python3 test/run_host_parity.py`; build; flash; take off, hover and land on the SE3 cascade | parity passes; image ends below sector 7; hover as before |
 
 ## What it does
 
-- **This is the `onboard_only` branch: onboard rpm control only.** The
-  app flies rpm-family slots (`attitude`, `rpm`, `rpm_direct`): the network
-  commands per-motor rotor speeds, the app mixes them, maps them to PWM and
-  applies them through the PID's per-motor bypass — no onboard controller
-  runs while engaged. A slot of another kind fails validation
-  (`nnpol.slotStatus` 6); the Mellinger and ctbr paths and the inner
-  controllers they need live on the `nnpol` branch. There is no offboard
-  policy route. The ground station streams one thing, the SE3 cascade's rate
-  setpoint on `/ctbr_cmd` (takeoff, hover, landing, and the hold-here
-  keepalive during a race), and the network only ever runs here, from a
-  flash slot. The host-side per-motor packet (type 12) is removed from
-  `crtp_commander_generic.c`.
 - `CONFIG_CONTROLLER_OOT` registers this app as `stabilizer.controller = 6`.
   With `nnpol.enable = 0` (default) the radio setpoint passes straight
   through to the stock PID, so behaviour is identical to
-  `stabilizer.controller = 1`, which is validation step 1. The driver's
-  `onboard_controller: oot` is controller 6 with the legacy packet read as
-  rates.
-- **The app is checkpoint-agnostic: build and flash it once.** Policies
-  are `policy_slot.bin` blobs written by `mjc_dronetests/export_policy_c.py`
-  (a 256-byte header — identity hash, dims, activation, decode kind, action
-  box or mixer anchors, thrust identification, task constants — plus the
-  fp32 weights) that live in the internal-flash sectors 7-11, one 128 KB
-  slot each, uploaded through the `MEM_TYPE_APP` memory handler and
-  selected with `nnpol.slot`. The app task validates the selected slot
-  (CRC) and publishes its identity in the read-only `nnpol.hash0-3` /
-  `obsDim` / `actDim` / `kind` / `taskId` / `ctrlHz` params, which the
-  ground station checks before engaging. crazyflie-ros does all of this
-  from `config.yaml`: a drone's run directory is found in a slot or
-  uploaded into a free one, then selected — no reflash.
+  `stabilizer.controller = 1`. The only thing the ground station streams is
+  the SE3 cascade's rate setpoint (takeoff, hover, landing, and the
+  hold-here keepalive during a race).
+- **The app is checkpoint-agnostic: build and flash it once.** A policy is
+  a slot blob (a 256-byte header — identity, dims, activation, action map
+  anchors, motor identification, task constants — plus the fp32 weights;
+  `test/nnpol_blob.py` is the reference writer). Blobs live in internal-flash
+  sectors 7-11, one 128 KB slot each, uploaded through the `MEM_TYPE_APP`
+  memory handler and selected with `nnpol.slot`. The app task validates the
+  selected slot (CRC) and publishes its identity in the read-only
+  `nnpol.hash0-3` / `obsDim` / `actDim` / `kind` / `taskId` / `ctrlHz`
+  params, which the ground station checks before engaging.
 - On every policy tick (`nnpol.ctrlHz`, a writable param defaulting to the
-  slot's trained `ctrl_freq`; the host pushes `policy.inference_hz` before
-  engaging) the controller snapshots the EKF state + gyro and notifies the
-  app task, which builds the observation, runs the network through the
-  interpreter (`nnpol_policy.c`, weights read straight from the flash
-  slot — no RAM), decodes the action through the slot's mixer into four
-  rotor speeds and their PWM and publishes it into a sequence-locked
-  buffer. The controller applies the newest complete action as a
-  zero-order hold, synthesizing the per-motor `setpoint_t`
-  (`modeMotorPwm`) that `controllerPid` turns straight into motor ratios.
-  Inference never runs in the 1 kHz stabilizer context.
-- The build sets `CONFIG_ESTIMATOR_KALMAN_PREDICT_RATE=500` (app-config):
-  the Kalman dynamics prediction runs at 500 Hz instead of upstream's
-  100 Hz, so the position and velocity the policy observes are at most
-  2 ms behind the IMU rather than 10 ms. Measurement updates and the
-  externalized state already ran at 1 kHz. Costs about five times the
-  prediction step's CPU; watch for `Kalman prediction rate off` and
-  stabilizer rate warnings on the console. The downlink cannot follow:
-  cflib log periods are 10 ms multiples, so `/ekf_state` stays at 100 Hz.
-- The host keeps streaming its command topic as the commander-watchdog
-  keepalive and shadow reference; clearing `nnpol.enable` mid-flight is an
-  instantaneous, format-compatible takeover by that stream.
-- Observations: `traj_lissajous` (the fixed eight, constants in the slot
-  header), `traj_easy` (the run's curve pushed at engage as `nnpol.c*`)
-  and `race` / `race_random` v3 (the run's pinned track pushed at engage
-  as `nnpol.nGates` / `gate0` / `g<i>x..g<i>nz`, up to 8 gates; the
-  controller runs the gate-crossing test on every policy tick and logs
-  `nnpol.gateIdx`), each with or without the `motorobs` tail — the four
-  rotor speeds the app reads from its own bidirectional-DSHOT telemetry
-  (`motorsGetRPM`), held through dropouts from a hover start and
-  normalized by 15896.3 exactly as the host's `set_motor_rpm` does.
-- If the app task stops delivering actions, `nnpol.stale` counts and after
-  5 policy periods the controller falls back to the radio setpoint. A slot
-  whose task has no observation builder onboard (`taskId` 0xFFFF, the
-  world-frame `default` observation) never produces an action:
-  `nnpol.obsErr` counts and the fallback holds.
-- The rate becomes a stabilizer tick divider (`1000 / ctrlHz`, integer) at
-  the `enable` rising edge, so only divisors of 1000 (100, 125, 200, 250,
-  500 ...) run exactly; read-only `nnpol.runHz` reports what engaged.
+  slot's trained rate; it must divide 1000 to run exactly, `nnpol.runHz`
+  reports what engaged) the stabilizer snapshots EKF state, gyro and rotor
+  speeds on one tick, advances the gate state, and wakes the app task, which
+  builds the observation, runs the network and decodes the action. The
+  stabilizer applies the latest complete action as a zero-order hold
+  through the PID's per-motor bypass: no onboard controller runs while
+  engaged.
+- If the app task stops delivering actions (`nnpol.stale` counts), or the
+  ground station clears `nnpol.enable`, the vehicle flies the radio
+  setpoint again on the next controller tick.
+- Interpreter limits, enforced by slot validation: observation up to 64
+  wide, up to three hidden layers of up to 128 units, tanh or relu, clip or
+  tanh output map, and the blob must fit one 128 KB slot.
 
 ## Files
 
@@ -84,24 +62,23 @@ validation ladder: `mjc_dronetests/docs/onboard_inference_plan.md`.
 | `src/nnpol_controller.c` | firmware glue: OOT controller, app task, slot select/erase housekeeping, params, logs |
 | `src/nnpol_slot_bank.c` | the flash slot bank: MEM_TYPE_APP upload handler, sector erase (watchdog widened), validity scan |
 | `src/nnpol_slot.h` / `nnpol_slot_format.c` | the blob format and its validation (pure C, host-testable) |
-| `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh, output map from the header (clip for PPO, tanh for SAC / BPTT / TD3) (pure C) |
-| `src/nnpol_obs_lissajous.c` | the Lissajous-family body observations: the fixed eight or a pushed per-run curve (traj_easy), with the yaw anchor and the optional rotor-speed tail (pure C) |
-| `src/nnpol_obs_race.c` | the race v3 observation on the pushed pinned track, and the gate-crossing test (pure C) |
-| `src/nnpol_action.c` | the rpm family's decode: the header's mixer, rpm_scale, rpm-to-PWM (pure C) |
-| `test/` | host parity harness (plain gcc) + python runner, driven by a run directory's `policy_slot.bin` |
+| `src/nnpol_policy.c` | the MLP interpreter, blocked output-major kernel + fast tanh, output map from the header (pure C) |
+| `src/nnpol_obs_race.c` | the race v3 observation and the gate-crossing test (pure C) |
+| `src/nnpol_action.c` | the rpm family's decode: action map, rpm_scale, rotor speed to motor value (pure C) |
+| `test/nnpol_blob.py` | the blob format in Python: reference writer and parser |
+| `test/` | host parity harness (plain gcc) + python runner |
 
-## Slot protocol (what the ROS driver does)
+## Slot protocol (what the ground station does)
 
 1. `nnpol.slotErase = i` — the app task erases sector 7+i on the ground,
    disengaged and disarmed (the erase stalls the whole MCU for 1-2 s; the
    independent watchdog is widened around it). `nnpol.slotState` goes
    1 (erasing) → 2 (erased) or 3 (failed).
-2. Stream `policy_slot.bin` with cflib's memory write (`MEM_TYPE_APP`,
-   offset `i * 131072`): sequential acknowledged 24-byte chunks, each
-   whole words, programmed as they arrive. A word is programmed only if
-   it reads erased or already holds the same data (retransmits), so a
-   stale slot can never be half-overwritten. `nnpol.writeSlot` /
-   `writtenBytes` show progress.
+2. Stream the blob with cflib's memory write (`MEM_TYPE_APP`, offset
+   `i * 131072`): sequential acknowledged 24-byte chunks, each whole words,
+   programmed as they arrive. A word is programmed only if it reads erased
+   or already holds the same data (retransmits), so a stale slot can never
+   be half-overwritten. `nnpol.writeSlot` / `writtenBytes` show progress.
 3. `nnpol.slot = i` — the app task validates (CRC over the whole blob) and
    publishes the identity; `slotSel` confirms, `slotStatus` says why not.
    `nnpol.slotValid` is the bitmask of slots holding a valid blob.
@@ -115,51 +92,33 @@ pixi run --manifest-path ../../pixi.toml make -j                 # build
 pixi run --manifest-path ../../pixi.toml make cload              # flash
 ```
 
-The image must end below `0x08060000` (sector 7): ~308 KB today against a
+The image must end below `0x08060000` (sector 7): ~309 KB today against a
 368 KB ceiling (the bootloader takes the first 16 KB). `nnpolSlotBankInit`
-checks this at boot and disables the slot bank if the image overlaps it. Check the map before growing the firmware.
+checks this at boot and disables the slot bank if the image overlaps it. Check the size line of the build before growing the firmware.
 
 ## Host parity
 
 ```
-python3 test/run_host_parity.py --run-dir <run dir exported with export_policy_c.py>
+python3 test/run_host_parity.py            # synthetic blobs, no run directory needed
+python3 test/run_host_parity.py --blob policy_slot.bin
 ```
 
-Compiles the flight observation/action/interpreter C with host gcc,
-loads the run's `policy_slot.bin` exactly as a flash slot, validates it,
-and checks the network against the trainer's `policy_reference.npz` and
-the observation/decode against numpy transcriptions of the deployed host
-path. `--bag-npz` adds mocap-derived snapshots from a flight bag.
+Compiles the flight observation / action / interpreter C with host gcc,
+loads a blob exactly as a flash slot, validates it, and checks the network,
+the observation, the gate test and the decode against numpy transcriptions
+of the host path. Needs numpy.
 
 ## Param / log reference
 
-Params (`nnpol.`): `enable` (u8, the engage switch), `startPhase` (s),
-`offX/offY/offZ` (m, the host's curve pin), `yaw0` (rad, the run's yaw
-anchor), `cAmp0-2/cOmg0-2/cPh0-2/cCen0-2/cYaw` (a traj_easy run's curve),
-`nGates`, `gate0`, `g0x..g7nz` (a race run's pinned track),
-`vnom` (V, thrust-map battery voltage), `rpmScale` (MOTOR kind's
-rpm multiplier), `ctrlHz` (policy rate, default = the slot's `ctrl_freq`)
-— all latched at the `enable` rising edge; `slot` (select), `slotErase`;
-read-only: `slotSel`, `slotState`, `slotStatus`, `slotValid`, `nSlots`,
-`writeSlot`, `writtenBytes`, `runHz`, and the selected slot's identity
-`hash0-3`, `obsDim`, `actDim`, `kind`, `taskId`.
+Params (`nnpol.`): `enable` (u8, the engage switch); `nGates`, `gate0`,
+`g0x..g7nz` (the track), `vnom` (V), `rpmScale`, `ctrlHz` (policy rate,
+default = the slot's trained rate) — all latched at the `enable` rising
+edge; `slot` (select), `slotErase`; read-only: `slotSel`, `slotState`,
+`slotStatus`, `slotValid`, `nSlots`, `writeSlot`, `writtenBytes`, `runHz`,
+and the selected slot's identity `hash0-3`, `obsDim`, `actDim`, `kind`,
+`taskId`.
 
-Logs (`nnpol.`): `t`, `act0-3` (clipped network output), `pwm0-3` (the
-decoded per-motor PWM), `vbx/y/z`,
-`wbx/y/z`, `e0x/y/z` (observation excerpts), `us` (inference time),
-`stale`, `obsErr`, `gateIdx`, `seq`.
-
-## Engage protocol (what the ROS side does)
-
-1. find the run directory's hash in a slot or upload `policy_slot.bin`
-   into a free one; `nnpol.slot = i`; verify `nnpol.hash0-3` == the run
-   dir's `firmware_export.json`, and that the configured inference rate
-   divides 1000;
-2. take off, hover at the curve's engage point, keep streaming the
-   checkpoint's command topic (shadow);
-3. push `startPhase`, `offX/Y/Z`, `yaw0` (from the host's pin and
-   anchor), the curve (`c*`, traj_easy) or the track (`nGates`/`gate0`/`g*`,
-   race), `vnom`, `rpmScale`, `ctrlHz`;
-4. set `enable = 1`, confirm by readback → onboard flight;
-5. abort/land: clear `enable` first — the host stream takes over on the
-   next controller tick.
+Logs (`nnpol.`): `t` (seconds since engage), `act0-3` (clipped network
+output), `pwm0-3` (the decoded per-motor value), `vbx/y/z`, `wbx/y/z`,
+`e0x/y/z` (observation excerpts: body velocity, body rate, target gate
+offset), `us` (inference time), `stale`, `obsErr`, `gateIdx`, `seq`.

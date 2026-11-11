@@ -59,8 +59,11 @@ void nnpolRaceUpdateGate(const nnpolRaceTrack_t* track, float gateSide, const fl
   }
 }
 
-int nnpolRaceObsDim(const nnpolSlotHeader_t* hdr)
+int nnpolObsDim(const nnpolSlotHeader_t* hdr)
 {
+  if (hdr->taskId != NNPOL_TASK_RACE_V3) {
+    return 0;
+  }
   return 21 + (hdr->task[NNPOL_TASK_MOTOROBS] != 0.0f ? 4 : 0);
 }
 
@@ -86,11 +89,10 @@ static void worldToBody(const float R[3][3], const float v_w[3], float v_b[3])
   }
 }
 
-int nnpolRaceBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
-                      float obs[NNPOL_MAX_OBS_DIM])
+int nnpolBuildObs(const nnpolSlotHeader_t* hdr, const nnpolRaceTrack_t* track,
+                  const nnpolSnapshot_t* snap, float obs[NNPOL_MAX_OBS_DIM])
 {
-  const nnpolRaceTrack_t* track = &snap->race;
-  if (track->nGates == 0) {
+  if (hdr->taskId != NNPOL_TASK_RACE_V3 || track->nGates == 0) {
     return 0;
   }
   const float DEG2RAD = (float)M_PI / 180.0f;
@@ -107,7 +109,7 @@ int nnpolRaceBuildObs(const nnpolSlotHeader_t* hdr, const nnpolSnapshot_t* snap,
   /* gravity_B = R^T [0, 0, 1] = the third row of R. */
   obs[n++] = R[2][0]; obs[n++] = R[2][1]; obs[n++] = R[2][2];
 
-  const uint8_t idx = track->gateIdx % track->nGates;
+  const uint8_t idx = snap->gateIdx % track->nGates;
   const uint8_t nxt = (uint8_t)((idx + 1) % track->nGates);
   const uint8_t which[2] = { idx, nxt };
   for (int k = 0; k < 2; k++) {

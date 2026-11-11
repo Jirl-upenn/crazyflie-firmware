@@ -76,9 +76,11 @@ nnpolSlotStatus_t nnpolSlotValidate(const void* base, uint32_t capacityBytes)
   if (nnpolCrc32(bytes + 16, h->totalBytes - 16, 0) != h->crc32) {
     return NNPOL_SLOT_BAD_CRC;
   }
-  if (h->actionKind != NNPOL_ACTION_KIND_MOTOR) {
-    /* onboard_only: the setpoint kinds and the inner controllers they need
-     * live on the nnpol branch; here the only action is a rotor speed. */
+  if (h->actionKind != NNPOL_ACTION_KIND_MOTOR
+      || (h->mixer != NNPOL_MIXER_RPM_HOVER && h->mixer != NNPOL_MIXER_RPM_DIRECT)) {
+    /* The setpoint kinds and the inner controllers they need live on the
+     * nnpol branch; here the only action is a rotor speed, through one of
+     * the two maps the host still decodes. */
     return NNPOL_SLOT_BAD_KIND;
   }
   return NNPOL_SLOT_OK;

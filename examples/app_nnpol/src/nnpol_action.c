@@ -1,23 +1,17 @@
 /**
  * nnpol_action.c — clipped action -> per-motor rotor speed and PWM, the
- * rpm family's decode path transcribed from the deployed HOST path in
- * crazyflie-ros (MotorPwmRacingPolicy.decode), so the onboard and shadow
- * commands agree to float precision:
+ * rpm family's decode path transcribed from the HOST path in
+ * ros_quad_sim2real (controller/policy/motor.py MotorPwmRacingPolicy.decode),
+ * so the onboard and shadow commands agree to float precision:
  *
- *   mixer        the checkpoint's (crazyflow_interface/_mixer.py, mirrored in
- *                controller_motor_policy.py), selected by the slot header's
- *                mixer field: attitude (hover-anchored collective plus
- *                fixed-gain differentials, clipped), rpm (two hover-anchored
- *                segments per motor), rpm_direct (one line through
- *                [0, max_rpm])
+ *   action map   the checkpoint's (crazyflow_interface/_actions.py), selected
+ *                by the slot header's mixer field: rpm_hover (two
+ *                hover-anchored segments per motor) or rpm_direct (one line
+ *                through [0, max_rpm])
  *   rpm_scale    the host's hover-point calibration knob (nnpol.rpmScale)
  *   rpm_to_pwm   vmotor2rpm inverted at vnom, np.rint, clip to [0, 65535]
  *
- * onboard_only: this branch flies the rpm family only. The setpoint kinds
- * (Mellinger angles, ctbr rates) and the inner controllers they need live
- * on the nnpol branch; a slot of another kind fails validation here.
- *
- * Every constant comes from the slot header (mixer anchors, the drone's
+ * Every constant comes from the slot header (map anchors, the drone's
  * motor identification), so one build serves every rpm-family checkpoint.
  * Pure C: host-testable, no firmware includes.
  */
@@ -44,7 +38,7 @@ static float rpmToPwm(const nnpolSlotHeader_t* h, float rpm, float vnom)
   return pwm;
 }
 
-/* _mixer.mix_rpm_action: two hover-anchored segments, action 0 = exact hover. */
+/* _RpmHoverAdapter: two hover-anchored segments, action 0 = exact hover. */
 static float mixRpmAction(const nnpolSlotHeader_t* h, float a)
 {
   if (a <= 0.0f) {
@@ -55,35 +49,16 @@ static float mixRpmAction(const nnpolSlotHeader_t* h, float a)
 
 static void mixer(const nnpolSlotHeader_t* h, const float a[NNPOL_ACTION_DIM], float rpm[4])
 {
-  switch (h->mixer) {
-    case NNPOL_MIXER_ATTITUDE: {
-      /* _mixer.mix_attitude_rpm: [thrust_norm, roll, pitch, yaw_rate] ->
-       * hover-anchored collective plus fixed-gain differentials, clipped. */
-      const float collective = mixRpmAction(h, a[0]);
-      const float scale = h->differentialFrac * h->hoverRpm;
-      const float roll = a[1], pitch = a[2], yawRate = a[3];
-      rpm[0] = collective + roll * scale - pitch * scale - yawRate * scale;
-      rpm[1] = collective - roll * scale - pitch * scale + yawRate * scale;
-      rpm[2] = collective - roll * scale + pitch * scale - yawRate * scale;
-      rpm[3] = collective + roll * scale + pitch * scale + yawRate * scale;
-      for (int i = 0; i < 4; i++) {
-        if (rpm[i] < 0.0f) { rpm[i] = 0.0f; }
-        if (rpm[i] > h->maxRpm) { rpm[i] = h->maxRpm; }
-      }
-      break;
+  if (h->mixer == NNPOL_MIXER_RPM_DIRECT) {
+    /* rpm_direct: one line through [0, max_rpm], no hover anchor. */
+    for (int i = 0; i < 4; i++) {
+      rpm[i] = h->maxRpm * (a[i] + 1.0f) * 0.5f;
     }
-    case NNPOL_MIXER_RPM_DIRECT:
-      /* _mixer.rpm_direct: one line through [0, max_rpm], no hover anchor. */
-      for (int i = 0; i < 4; i++) {
-        rpm[i] = h->maxRpm * (a[i] + 1.0f) * 0.5f;
-      }
-      break;
-    default:
-      /* _mixer.mix_rpm_action per motor. */
-      for (int i = 0; i < 4; i++) {
-        rpm[i] = mixRpmAction(h, a[i]);
-      }
-      break;
+    return;
+  }
+  /* rpm_hover, per motor. */
+  for (int i = 0; i < 4; i++) {
+    rpm[i] = mixRpmAction(h, a[i]);
   }
 }
 

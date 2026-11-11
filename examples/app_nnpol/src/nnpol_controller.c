@@ -1,6 +1,8 @@
 /**
  * nnpol_controller.c — firmware glue for the onboard-policy app.
  *
+ * onboard-rpm: the race task only, rpm-family policies only.
+ *
  * Architecture (mjc_dronetests/docs/onboard_inference_plan.md section 3):
  * the OOT controller hook runs in the STABILIZER task at 1 kHz. On every
  * policy tick (every RATE_MAIN_LOOP / nnpol.ctrlHz stabilizer ticks) it
@@ -38,20 +40,18 @@
  * existing hash check verifies before engaging. Erase and select run in
  * the app task, only while nothing is engaged.
  *
- * Engage protocol (the ground station's side is crazyflie-ros
- * `exec: onboard`): select the slot, verify nnpol.hash0-3 against the run
- * directory's firmware_export.json, push startPhase/offX/offY/offZ/yaw0/
- * vnom/rpmScale/ctrlHz, then set enable = 1. The rising edge latches t0
- * and the pushed values, so the curve clock starts at the engage instant
- * with the host-pinned offset and heading.
+ * Engage protocol (the ground station's side is the onboard client of
+ * ros_quad_sim2real `onboard-rpm`): select the slot, verify nnpol.hash0-3
+ * against the blob the host compiled, push the track (nnpol.nGates / gate0 /
+ * g*), rpmScale and ctrlHz, then set enable = 1. The rising edge latches the
+ * pushed values, so nothing written mid-run moves the track.
  *
  * Policy rate: nnpol.ctrlHz is writable and defaults to the selected
  * slot's trained ctrl_freq. The rising edge turns it into a tick divider
  * (RATE_MAIN_LOOP / ctrlHz, integer), so only divisors of 1000 run
  * exactly — anything else runs at the next divisor UP (48 -> 50 Hz) and
  * the read-only nnpol.runHz reports what actually engaged. The host
- * validates divisibility before pushing; the curve clock is tick-based,
- * so a rate change never shifts the reference.
+ * validates divisibility before pushing.
  *
  * Staleness: if the app task stops producing actions (overrun, crash),
  * the controller counts policy periods without a fresh sequence number.
@@ -101,35 +101,26 @@
 // --------------------------------------------------------------------------
 
 static uint8_t nnpolEnable = 0;
-static float paramStartPhase = 0.0f;
-static float paramOffX = 0.0f;
-static float paramOffY = 0.0f;
-static float paramOffZ = 0.0f;
-static float paramYaw0 = 0.0f;      /* the run's yaw anchor, rad */
 static float paramVnom = 4.0f;      /* same fixed voltage the host maps thrust at */
 static float paramRpmScale = 1.0f;  /* MOTOR kind: the host's motor_pwm.rpm_scale */
-/* Latched from the params at the enable rising edge (like the pin), so a
- * mid-run param write cannot rescale the motors or re-anchor the run;
- * read by the app task. */
+/* Latched from the param at the enable rising edge, so a mid-run param
+ * write cannot rescale the motors; read by the app task. */
 static float activeRpmScale = 1.0f;
-static float activeYaw0 = 0.0f;
-/* EASY_BODY: this run's curve, pushed by the host before enable (the
- * nominal member of the family; the pin offset and yaw anchor are pushed
- * separately, as for the fixed eight) and latched at the rising edge. */
-static float paramCurve[NNPOL_CURVE_FLOATS] = { 0 };
-static float activeCurve[NNPOL_CURVE_FLOATS] = { 0 };
 /* motorobs: the last valid reading per motor, normalized. Starts at hover
  * (1.0) — a state a flying drone is in, unlike zero — and holds through
  * DSHOT telemetry dropouts, exactly as the host's set_motor_rpm does. */
 static float heldRpm[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-/* RACE_V3: the track as pinned by the host (nnpol.g*), the first target
- * gate (nnpol.gate0) — latched at the rising edge — and the gate state the
- * stabilizer advances every policy tick (RacePlugin.step's crossing test). */
+/* The track as the host placed it (nnpol.g*), the first target gate
+ * (nnpol.gate0) — latched at the rising edge — and the gate state the
+ * stabilizer advances every policy tick (RacePlugin.step's crossing test).
+ * activeTrack changes only at the rising edge, before the first snapshot of
+ * the run, so the app task reads it without a lock. */
 static uint8_t paramNGates = 0;
 static uint8_t paramGate0 = 0;
 static float paramGates[NNPOL_MAX_GATES][6];   /* x y z nx ny nz per gate */
 static nnpolRaceTrack_t activeTrack;
 static float racePrevGateX = 1.0f;
+static uint8_t activeGateIdx = 0;
 static uint8_t logGateIdx = 0;
 
 /* Policy rate. Writable (the host's policy.inference_hz), defaulting to the
@@ -369,7 +360,7 @@ void appMain()
     const uint64_t tStart = usecTimestamp();
 
     float obs[NNPOL_MAX_OBS_DIM];
-    const int obsDim = nnpolBuildObs(activePolicy.hdr, &snap, obs);
+    const int obsDim = nnpolBuildObs(activePolicy.hdr, &activeTrack, &snap, obs);
     if (obsDim != (int)activePolicy.hdr->obsDim) {
       if (logObsErr < 0xFFFFu) { logObsErr++; }
       continue;                     /* no action: the stale fallback takes over */
@@ -396,9 +387,9 @@ void appMain()
     for (int i = 0; i < 4; i++) {
       logPwm[i] = (uint16_t)cmd.motorPwm[i];
     }
-    memcpy(logVb, &obs[4], sizeof(logVb));   /* v_B */
-    memcpy(logWb, &obs[7], sizeof(logWb));   /* omega_B */
-    memcpy(logE0, &obs[10], sizeof(logE0));  /* first lookahead sample */
+    memcpy(logVb, &obs[0], sizeof(logVb));   /* v_B */
+    memcpy(logWb, &obs[3], sizeof(logWb));   /* omega_B */
+    memcpy(logE0, &obs[9], sizeof(logE0));   /* target gate offset, body frame */
     logUs = (uint16_t)(elapsed > 0xFFFFu ? 0xFFFFu : elapsed);
     logSeq++;
   }
@@ -411,8 +402,6 @@ void appMain()
 /* Engage state, owned by the stabilizer context. */
 static bool wasEnabled = false;
 static uint32_t t0Tick = 0;
-static float activeStartPhase = 0.0f;
-static float activeOff[3] = { 0.0f, 0.0f, 0.0f };
 static uint32_t seqAtEngage = 0;      /* only actions newer than this fly */
 static uint32_t lastSeqSeen = 0;
 static uint16_t periodsWithoutFresh = 0;
@@ -458,18 +447,12 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
   nnpolSlotBankSetLocked(nnpolEnable != 0 || supervisorIsArmed());
 
   if (enabled && !wasEnabled) {
-    /* Rising edge: the curve clock starts NOW, with the values the host
+    /* Rising edge: the run clock starts NOW, with the values the host
      * pushed before flipping enable. Latching them here (not reading the
-     * params live) means a mid-run param write cannot shift the clock,
-     * teleport the curve or re-anchor the heading. */
+     * params live) means a mid-run param write cannot move the track or
+     * rescale the motors. */
     t0Tick = tick;
-    activeStartPhase = paramStartPhase;
-    activeOff[0] = paramOffX;
-    activeOff[1] = paramOffY;
-    activeOff[2] = paramOffZ;
-    activeYaw0 = paramYaw0;
     activeRpmScale = paramRpmScale;
-    memcpy(activeCurve, paramCurve, sizeof(activeCurve));
     /* The race track and its state: gate_idx = initial_gate, prev_gate_x
      * = 1.0, as RacePlugin.reset_task_state / RaceV3.reset. */
     activeTrack.nGates = paramNGates > NNPOL_MAX_GATES ? NNPOL_MAX_GATES : paramNGates;
@@ -479,7 +462,7 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
         activeTrack.normals[i][k] = paramGates[i][3 + k];
       }
     }
-    activeTrack.gateIdx = activeTrack.nGates ? (uint8_t)(paramGate0 % activeTrack.nGates) : 0;
+    activeGateIdx = activeTrack.nGates ? (uint8_t)(paramGate0 % activeTrack.nGates) : 0;
     racePrevGateX = 1.0f;
     activeDivider = tickDividerFor(paramCtrlHz);
     paramRunHz = (uint16_t)(RATE_MAIN_LOOP / activeDivider);
@@ -495,13 +478,9 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
   if (enabled && (tick % activeDivider) == 0u) {
     /* Policy tick: snapshot a consistent state and wake the app task.
      * The EKF quaternion is stored x, y, z, w; the observation wants
-     * scalar-first — reordered here, anchored and sign-normalized in
-     * nnpolBuildObs. */
+     * scalar-first — reordered here. */
     nnpolSnapshot_t snap;
-    snap.t = activeStartPhase + (float)(tick - t0Tick) * 0.001f;
-    snap.off[0] = activeOff[0];
-    snap.off[1] = activeOff[1];
-    snap.off[2] = activeOff[2];
+    snap.t = (float)(tick - t0Tick) * 0.001f;
     snap.pos[0] = state->position.x;
     snap.pos[1] = state->position.y;
     snap.pos[2] = state->position.z;
@@ -515,17 +494,15 @@ void controllerOutOfTree(control_t* control, const setpoint_t* setpoint,
     snap.gyro_deg[0] = sensors->gyro.x;
     snap.gyro_deg[1] = sensors->gyro.y;
     snap.gyro_deg[2] = sensors->gyro.z;
-    snap.yaw0 = activeYaw0;
-    memcpy(snap.curve, activeCurve, sizeof(snap.curve));
     /* Race gate state, advanced with the EKF position (the host advances
      * its shadow copy with mocap): the crossing test costs a dot product
      * and runs here so the app task sees one consistent gate per tick. */
     if (activeValid && activePolicy.hdr->taskId == NNPOL_TASK_RACE_V3) {
       nnpolRaceUpdateGate(&activeTrack, activePolicy.hdr->task[NNPOL_TASK_GATE_SIDE],
-                          snap.pos, &activeTrack.gateIdx, &racePrevGateX);
-      logGateIdx = activeTrack.gateIdx;
+                          snap.pos, &activeGateIdx, &racePrevGateX);
+      logGateIdx = activeGateIdx;
     }
-    snap.race = activeTrack;
+    snap.gateIdx = activeGateIdx;
     /* Bidirectional-DSHOT rotor speed (motors.c): UINT16_MAX = invalid or
      * no reply, held per motor. Read on every policy tick regardless of the
      * slot's observation so the hold is warm when a motorobs slot engages. */
@@ -604,37 +581,9 @@ PARAM_GROUP_START(nnpol)
  * format-compatible takeover by the host stream. Has no effect without a
  * selected, valid slot. */
 PARAM_ADD(PARAM_UINT8, enable, &nnpolEnable)
-/** @brief Curve phase (s) the clock starts at on the enable rising edge. */
-PARAM_ADD(PARAM_FLOAT, startPhase, &paramStartPhase)
-/** @brief World-frame curve translation, pushed by the host's pin. */
-PARAM_ADD(PARAM_FLOAT, offX, &paramOffX)
-PARAM_ADD(PARAM_FLOAT, offY, &paramOffY)
-PARAM_ADD(PARAM_FLOAT, offZ, &paramOffZ)
-/** @brief The run's yaw anchor (rad): the engage heading the curve is yawed
- * to and the observed attitude is relative to; added back to a commanded
- * yaw angle. Pushed by the host (world_yaw_offset). */
-PARAM_ADD(PARAM_FLOAT, yaw0, &paramYaw0)
-/** @brief traj_easy: this run's curve, the nominal member of the Lissajous
- * family the host drew (controller_trajectory.Curve): amplitudes (m),
- * angular rates (rad/s), phases (rad), centre (m), yaw (rad). Latched at
- * the enable rising edge; ignored by the fixed-eight slots. */
-PARAM_ADD(PARAM_FLOAT, cAmp0, &paramCurve[0])
-PARAM_ADD(PARAM_FLOAT, cAmp1, &paramCurve[1])
-PARAM_ADD(PARAM_FLOAT, cAmp2, &paramCurve[2])
-PARAM_ADD(PARAM_FLOAT, cOmg0, &paramCurve[3])
-PARAM_ADD(PARAM_FLOAT, cOmg1, &paramCurve[4])
-PARAM_ADD(PARAM_FLOAT, cOmg2, &paramCurve[5])
-PARAM_ADD(PARAM_FLOAT, cPh0, &paramCurve[6])
-PARAM_ADD(PARAM_FLOAT, cPh1, &paramCurve[7])
-PARAM_ADD(PARAM_FLOAT, cPh2, &paramCurve[8])
-PARAM_ADD(PARAM_FLOAT, cCen0, &paramCurve[9])
-PARAM_ADD(PARAM_FLOAT, cCen1, &paramCurve[10])
-PARAM_ADD(PARAM_FLOAT, cCen2, &paramCurve[11])
-PARAM_ADD(PARAM_FLOAT, cYaw, &paramCurve[12])
-/** @brief race: the track as the host pinned it for this run (RaceV3
- * .pin_start_gate): gates in use, the first target gate, and per gate the
- * world position (m) and unit approach normal. Latched at the enable
- * rising edge; ignored by the trajectory slots. */
+/** @brief The track as the host placed it for this run: gates in use, the
+ * first target gate, and per gate the world position (m) and unit approach
+ * normal. Latched at the enable rising edge. */
 PARAM_ADD(PARAM_UINT8, nGates, &paramNGates)
 PARAM_ADD(PARAM_UINT8, gate0, &paramGate0)
 PARAM_ADD(PARAM_FLOAT, g0x, &paramGates[0][0])
@@ -725,7 +674,7 @@ PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, obsDim, &paramObsDim)
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, actDim, &paramActDim)
 /** @brief Decode path of the selected slot: always 2 (motor) on this branch. */
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, kind, &paramKind)
-/** @brief Observation builder of the selected slot (0 lissajous/body). */
+/** @brief Observation builder of the selected slot (2 = race v3). */
 PARAM_ADD(PARAM_UINT16 | PARAM_RONLY, taskId, &paramTaskId)
 PARAM_GROUP_STOP(nnpol)
 
@@ -734,7 +683,7 @@ PARAM_GROUP_STOP(nnpol)
  * rate for the shadow diff (bin/compare_shadow.py in crazyflie-ros).
  */
 LOG_GROUP_START(nnpol)
-/** @brief Curve clock (s) of the last observation. */
+/** @brief Seconds since engage of the last observation. */
 LOG_ADD(LOG_FLOAT, t, &logT)
 /** @brief Clipped network output. */
 LOG_ADD(LOG_FLOAT, act0, &logAct[0])
@@ -746,7 +695,7 @@ LOG_ADD(LOG_UINT16, pwm0, &logPwm[0])
 LOG_ADD(LOG_UINT16, pwm1, &logPwm[1])
 LOG_ADD(LOG_UINT16, pwm2, &logPwm[2])
 LOG_ADD(LOG_UINT16, pwm3, &logPwm[3])
-/** @brief Observation excerpts: body velocity, body rate, first lookahead. */
+/** @brief Observation excerpts: body velocity, body rate, target gate offset (body). */
 LOG_ADD(LOG_FLOAT, vbx, &logVb[0])
 LOG_ADD(LOG_FLOAT, vby, &logVb[1])
 LOG_ADD(LOG_FLOAT, vbz, &logVb[2])

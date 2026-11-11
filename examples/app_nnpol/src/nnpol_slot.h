@@ -1,7 +1,6 @@
 /**
  * nnpol_slot.h — the policy SLOT format: one self-describing blob per
- * checkpoint, written by mjc_dronetests/export_policy_c.py as
- * policy_slot.bin, uploaded over the radio into one of the app's flash
+ * checkpoint (test/nnpol_blob.py is the reference writer), uploaded over the radio into one of the app's flash
  * slots (nnpol_slot_bank.c) and selected by the ground station by
  * identity hash — so switching checkpoints is a config.yaml edit, not a
  * reflash. Everything the app needs is in the 256-byte header; the
@@ -29,10 +28,11 @@
 #define NNPOL_ACTION_KIND_MELLINGER 0  /* attitude box -> firmware Mellinger */
 #define NNPOL_ACTION_KIND_CTBR 1       /* body-rate box -> firmware rate PID */
 #define NNPOL_ACTION_KIND_MOTOR 2      /* mixer -> per-motor PWM, no onboard loop */
-/* Mixers for the MOTOR kind (export_policy_c.MIXER_FOR_TYPE). */
-#define NNPOL_MIXER_ATTITUDE 0
-#define NNPOL_MIXER_RPM 1
-#define NNPOL_MIXER_RPM_DIRECT 2
+/* Action maps of the MOTOR kind (crazyflow_interface/_actions.py, the host's
+ * controller/policy/motor.py). 0 was the attitude mixer of the older
+ * branches; it has no host counterpart any more and fails validation. */
+#define NNPOL_MIXER_RPM_HOVER 1        /* rpm_hover: two segments anchored at hover */
+#define NNPOL_MIXER_RPM_DIRECT 2       /* rpm_direct: one line through [0, max_rpm] */
 /* Activations (export_policy_c.ACTIVATION_ID). */
 #define NNPOL_ACT_TANH 0
 #define NNPOL_ACT_RELU 1
@@ -42,27 +42,20 @@
  * squash inside the forward pass. */
 #define NNPOL_SQUASH_NONE 0
 #define NNPOL_SQUASH_TANH 1
-/* Observation builders (export_policy_c.TASK_ID), all in nnpol_obs_lissajous.c. */
-#define NNPOL_TASK_LISSAJOUS_BODY 0    /* traj_lissajous / body[_motorobs]: the fixed eight */
-#define NNPOL_TASK_EASY_BODY 1         /* traj_easy / body[_motorobs]: a per-run curve
-                                          pushed at engage (nnpol.c*) */
-#define NNPOL_TASK_RACE_V3 2           /* race / v3[_motorobs]: the pinned track is
-                                          pushed at engage (nnpol.g*); nnpol_obs_race.c */
+/* Observation builders (the exporter's TASK_ID). onboard-rpm builds the race
+ * observation only; ids 0 and 1 were the Lissajous tracking tasks of the
+ * nnpol / onboard_only branches and are refused at engage here (selectable,
+ * so the ground station can name the run, but every tick counts an obsErr). */
+#define NNPOL_TASK_RACE_V3 2           /* race / v3[_motorobs]: the track is
+                                          pushed before engage; nnpol_obs_race.c */
 #define NNPOL_TASK_UNSUPPORTED 0xFFFF  /* exported, uploadable, but cannot engage */
-/* task[] indices shared by both builders (export_policy_c.slot_task). */
-#define NNPOL_TASK_T_PERIOD 0          /* LISSAJOUS: fundamental period, s */
-#define NNPOL_TASK_AMPLITUDE 1         /* LISSAJOUS: x amplitude, m (z is half) */
-#define NNPOL_TASK_CENTER_Z 2          /* LISSAJOUS: centre height, m */
-#define NNPOL_TASK_N_SAMPLES 3         /* lookahead samples (as a float) */
-#define NNPOL_TASK_SAMPLES_DT 4        /* lookahead spacing, s */
-#define NNPOL_TASK_START_PHASE 5       /* LISSAJOUS: default engage phase, s */
+/* task[] indices (the exporter's slot_task); 0..5 are unused by the race task. */
 #define NNPOL_TASK_MOTOROBS 6          /* != 0: append 4 normalized rotor speeds */
 #define NNPOL_TASK_GATE_SIDE 7         /* RACE: gate side length, m (the crossing square) */
 #define NNPOL_MAX_GATES 8              /* RACE: the pushed track's capacity */
 /* Rotor-speed normalizer of the motorobs observations: the trainer's
  * NOMINAL_HOVER_RPM (every tasks package: 15896.3; crazyflie-ros TaskObs). */
 #define NNPOL_NOMINAL_HOVER_RPM 15896.296489245326f
-#define NNPOL_CURVE_FLOATS 13          /* EASY: amp(3) omega(3) phase(3) center(3) yaw */
 
 /* Interpreter limits: a header outside these fails validation. */
 #define NNPOL_MAX_OBS_DIM 64
@@ -117,7 +110,7 @@ typedef enum {
   NNPOL_SLOT_BAD_SIZE = 3,   /* header/total bytes inconsistent or > capacity */
   NNPOL_SLOT_BAD_DIMS = 4,   /* outside the interpreter's limits */
   NNPOL_SLOT_BAD_CRC = 5,
-  NNPOL_SLOT_BAD_KIND = 6,   /* onboard_only: not an rpm-family (MOTOR) policy */
+  NNPOL_SLOT_BAD_KIND = 6,   /* not an rpm-family (MOTOR) policy, or an unknown action map */
 } nnpolSlotStatus_t;
 
 /** zlib/binascii-compatible CRC-32 (reflected 0xEDB88320, init/xor

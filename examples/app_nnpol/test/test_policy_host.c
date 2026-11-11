@@ -2,30 +2,27 @@
  * test_policy_host.c — host-side parity harness for app_nnpol.
  *
  * Compiled with plain gcc against the SAME pure-C modules the firmware
- * builds (slot format, interpreter, observation, decode), loading a
- * policy_slot.bin the way the firmware reads a flash slot, so what is
- * checked is the flight code itself, not a transcription of it. Driven by
- * run_host_parity.py, which feeds binary records on stdin and compares
- * the answers against the trainer's numpy reference
- * (policy_reference.npz) and against its own numpy transcriptions of the
- * observation and decode.
+ * builds (slot format, interpreter, observation, decode), loading a slot
+ * blob the way the firmware reads a flash slot, so what is checked is the
+ * flight code itself, not a transcription of it. Driven by
+ * run_host_parity.py, which feeds binary records on stdin and compares the
+ * answers against its own numpy transcriptions of the host implementation.
  *
  * Usage: nnpol_host <mode> <policy_slot.bin>
  *
  * Modes; all records are little-endian float32 streams:
  *   info   : prints "status obsDim actionDim numLayers kind mixer taskId ctrlHz"
  *   policy : obs[obsDim]                          -> act[4]   (raw, unclipped)
- *   obs    : snapshot[85]                         -> obs[obsDim]
+ *   obs    : snapshot[SNAP], track[TRACK]         -> obs[obsDim]
  *   act    : action[4], vnom, rpmScale            -> cmd[8]
- *   full   : snapshot[85], vnom, rpmScale         -> cmd[8]   (obs -> net -> clip -> decode)
- *   gate   : pos(3), gateSide, gateIdx, prevGateX, nGates, gates(8x3), normals(8x3)
+ *   full   : snapshot[SNAP], track[TRACK], vnom, rpmScale
+ *                                                 -> cmd[8]   (obs -> net -> clip -> decode)
+ *   gate   : pos(3), gateSide, gateIdx, prevGateX, track[TRACK]
  *                                                 -> [gateIdx, prevGateX] (one crossing-test step)
  *
- * snapshot[85] = [t, off(3), pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), yaw0,
- *                 curve(13: amp3 omega3 phase3 center3 yaw), rpm_norm(4),
- *                 race: nGates, gateIdx, gates(8 x 3), normals(8 x 3)]
- * cmd[8]       = [rpm(4), motorPwm(4)]   — nnpolCmd_t flattened (onboard_only:
- *                 the rpm family only)
+ * snapshot[19] = [t, pos(3), quat_wxyz(4), vel_w(3), gyro_deg(3), rpm_norm(4), gateIdx]
+ * track[49]    = [nGates, gates(8 x 3), normals(8 x 3)]
+ * cmd[8]       = [rpm(4), motorPwm(4)]   — nnpolCmd_t flattened
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +30,8 @@
 
 #include "nnpol.h"
 
-#define SNAP_FLOATS 85
+#define SNAP_FLOATS 19
+#define TRACK_FLOATS (1 + 6 * NNPOL_MAX_GATES)
 #define CMD_FLOATS 8
 #define ACT_IN_FLOATS (NNPOL_ACTION_DIM + 2)
 #define SLOT_CAPACITY 0x20000u
@@ -43,19 +41,20 @@ static uint8_t g_slot[SLOT_CAPACITY];
 static void unpackSnapshot(const float* in, nnpolSnapshot_t* s)
 {
   s->t = in[0];
-  memcpy(s->off, in + 1, 3 * sizeof(float));
-  memcpy(s->pos, in + 4, 3 * sizeof(float));
-  memcpy(s->quat_wxyz, in + 7, 4 * sizeof(float));
-  memcpy(s->vel_w, in + 11, 3 * sizeof(float));
-  memcpy(s->gyro_deg, in + 14, 3 * sizeof(float));
-  s->yaw0 = in[17];
-  memcpy(s->curve, in + 18, NNPOL_CURVE_FLOATS * sizeof(float));
-  memcpy(s->rpm, in + 31, 4 * sizeof(float));
-  s->race.nGates = (uint8_t)in[35];
-  s->race.gateIdx = (uint8_t)in[36];
+  memcpy(s->pos, in + 1, 3 * sizeof(float));
+  memcpy(s->quat_wxyz, in + 4, 4 * sizeof(float));
+  memcpy(s->vel_w, in + 8, 3 * sizeof(float));
+  memcpy(s->gyro_deg, in + 11, 3 * sizeof(float));
+  memcpy(s->rpm, in + 14, 4 * sizeof(float));
+  s->gateIdx = (uint8_t)in[18];
+}
+
+static void unpackTrack(const float* in, nnpolRaceTrack_t* t)
+{
+  t->nGates = (uint8_t)in[0];
   for (int i = 0; i < NNPOL_MAX_GATES; i++) {
-    memcpy(s->race.gates[i], in + 37 + 3 * i, 3 * sizeof(float));
-    memcpy(s->race.normals[i], in + 61 + 3 * i, 3 * sizeof(float));
+    memcpy(t->gates[i], in + 1 + 3 * i, 3 * sizeof(float));
+    memcpy(t->normals[i], in + 1 + 3 * NNPOL_MAX_GATES + 3 * i, 3 * sizeof(float));
   }
 }
 
@@ -76,7 +75,7 @@ static void clipAction(float* act)
 int main(int argc, char** argv)
 {
   if (argc != 3) {
-    fprintf(stderr, "usage: %s {info|policy|obs|act|full} policy_slot.bin\n", argv[0]);
+    fprintf(stderr, "usage: %s {info|policy|obs|act|full|gate} policy_slot.bin\n", argv[0]);
     return 2;
   }
   const char* mode = argv[1];
@@ -117,11 +116,13 @@ int main(int argc, char** argv)
       fwrite(act, sizeof(float), NNPOL_ACTION_DIM, stdout);
     }
   } else if (strcmp(mode, "obs") == 0) {
-    float in[SNAP_FLOATS], obs[NNPOL_MAX_OBS_DIM];
+    float in[SNAP_FLOATS + TRACK_FLOATS], obs[NNPOL_MAX_OBS_DIM];
     nnpolSnapshot_t snap;
-    while (fread(in, sizeof(float), SNAP_FLOATS, stdin) == SNAP_FLOATS) {
+    nnpolRaceTrack_t track;
+    while (fread(in, sizeof(float), SNAP_FLOATS + TRACK_FLOATS, stdin) == SNAP_FLOATS + TRACK_FLOATS) {
       unpackSnapshot(in, &snap);
-      const int got = nnpolBuildObs(hdr, &snap, obs);
+      unpackTrack(in + SNAP_FLOATS, &track);
+      const int got = nnpolBuildObs(hdr, &track, &snap, obs);
       if (got != obsDim) {
         fprintf(stderr, "observation builder returned %d, header says %d\n", got, obsDim);
         return 1;
@@ -129,18 +130,13 @@ int main(int argc, char** argv)
       fwrite(obs, sizeof(float), obsDim, stdout);
     }
   } else if (strcmp(mode, "gate") == 0) {
-    float in[7 + 6 * NNPOL_MAX_GATES], out[2];
-    const size_t nin = 7 + 6 * NNPOL_MAX_GATES;
+    float in[6 + TRACK_FLOATS], out[2];
+    const size_t nin = 6 + TRACK_FLOATS;
     while (fread(in, sizeof(float), nin, stdin) == nin) {
       nnpolRaceTrack_t track;
-      track.nGates = (uint8_t)in[6];
+      unpackTrack(in + 6, &track);
       uint8_t gateIdx = (uint8_t)in[4];
       float prevGateX = in[5];
-      for (int i = 0; i < NNPOL_MAX_GATES; i++) {
-        memcpy(track.gates[i], in + 7 + 3 * i, 3 * sizeof(float));
-        memcpy(track.normals[i], in + 7 + 3 * NNPOL_MAX_GATES + 3 * i, 3 * sizeof(float));
-      }
-      track.gateIdx = gateIdx;
       nnpolRaceUpdateGate(&track, in[3], in, &gateIdx, &prevGateX);
       out[0] = (float)gateIdx;
       out[1] = prevGateX;
@@ -155,17 +151,21 @@ int main(int argc, char** argv)
       fwrite(out, sizeof(float), CMD_FLOATS, stdout);
     }
   } else if (strcmp(mode, "full") == 0) {
-    float in[SNAP_FLOATS + 2], obs[NNPOL_MAX_OBS_DIM], act[NNPOL_ACTION_DIM], out[CMD_FLOATS];
+    const size_t nin = SNAP_FLOATS + TRACK_FLOATS + 2;
+    float in[SNAP_FLOATS + TRACK_FLOATS + 2], obs[NNPOL_MAX_OBS_DIM], act[NNPOL_ACTION_DIM],
+        out[CMD_FLOATS];
     nnpolSnapshot_t snap;
+    nnpolRaceTrack_t track;
     nnpolCmd_t cmd;
-    while (fread(in, sizeof(float), SNAP_FLOATS + 2, stdin) == SNAP_FLOATS + 2) {
+    while (fread(in, sizeof(float), nin, stdin) == nin) {
       unpackSnapshot(in, &snap);
-      if (nnpolBuildObs(hdr, &snap, obs) != obsDim) {
+      unpackTrack(in + SNAP_FLOATS, &track);
+      if (nnpolBuildObs(hdr, &track, &snap, obs) != obsDim) {
         return 1;
       }
       nnpolForward(&policy, obs, act);
       clipAction(act);
-      nnpolDecodeAction(hdr, act, in[SNAP_FLOATS], in[SNAP_FLOATS + 1], &cmd);
+      nnpolDecodeAction(hdr, act, in[nin - 2], in[nin - 1], &cmd);
       packCmd(&cmd, out);
       fwrite(out, sizeof(float), CMD_FLOATS, stdout);
     }
